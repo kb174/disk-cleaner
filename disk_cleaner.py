@@ -160,7 +160,7 @@ def settings_path():
 def load_settings():
     import json
     try:
-        with open(settings_path(), encoding="utf-8") as f:
+        with open(settings_path(), encoding="utf-8-sig") as f:   # -sig: файл мог сохранить редактор с BOM
             return json.load(f)
     except (OSError, ValueError):
         return {}
@@ -1073,6 +1073,189 @@ class Table(ttk.Frame):
         return header, self.rows
 
 
+# ---------------------------------------------------------------- обучение (пошаговый мастер)
+class Tour:
+    """Затемняет окно, «вырезает» дыру над нужным элементом (через неё можно нажимать) и показывает подсказку.
+    Шаг: dict(target=функция -> виджет | [виджеты] | (x0, y0, x1, y1) | None, title, text,
+              wait=None | "path" | "scan_start" | "scan_done" | "tab", cond=функция -> bool)."""
+    HOLE = "#ff00fe"          # цвет-ключ: эти пиксели оверлея прозрачны и пропускают щелчки
+
+    def __init__(self, app, steps, on_finish):
+        self.app, self.steps, self.on_finish = app, steps, on_finish
+        self.i, self.alive, self._last, self._no_auto = 0, True, None, -1
+        self.ov = tk.Toplevel(app)
+        self.ov.overrideredirect(True)
+        self.ov.transient(app)
+        try:
+            self.ov.attributes("-alpha", 0.6)
+            self.ov.attributes("-transparentcolor", self.HOLE)
+        except tk.TclError:
+            pass
+        self.cv = tk.Canvas(self.ov, bg="#000000", highlightthickness=0, bd=0, cursor="arrow")
+        self.cv.pack(fill="both", expand=True)
+        self.cv.bind("<Button-1>", lambda e: self._nudge())
+        self.box = tk.Toplevel(app)
+        self.box.overrideredirect(True)
+        self.box.transient(app)
+        self.box.bind("<Escape>", lambda e: self.finish())
+        app.bind("<Escape>", lambda e: self.finish(), add="+")
+        self.show(0)
+        self._tick()
+
+    # --- геометрия
+    def _rect(self):
+        t = self.steps[self.i].get("target")
+        t = t() if callable(t) else t
+        if t is None:
+            return None
+        if isinstance(t, tuple):
+            return t
+        rects = []
+        for w in (t if isinstance(t, list) else [t]):
+            try:
+                if w.winfo_ismapped():
+                    x, y = w.winfo_rootx(), w.winfo_rooty()
+                    rects.append((x, y, x + w.winfo_width(), y + w.winfo_height()))
+            except tk.TclError:
+                pass
+        if not rects:
+            return None
+        return (min(r[0] for r in rects), min(r[1] for r in rects),
+                max(r[2] for r in rects), max(r[3] for r in rects))
+
+    def _tick(self):
+        if not self.alive:
+            return
+        try:
+            self._layout()
+            step = self.steps[self.i]
+            if step.get("cond_auto") and self.i != self._no_auto and step["cond_auto"]():
+                self.next()
+        except tk.TclError:
+            pass
+        self.app.after(150, self._tick)
+
+    def _layout(self, force=False):
+        a = self.app
+        if a.state() == "iconic":
+            return
+        ax, ay, aw, ah = a.winfo_rootx(), a.winfo_rooty(), a.winfo_width(), a.winfo_height()
+        r = self._rect()
+        key = (ax, ay, aw, ah, r, self.i)
+        if key != self._last or force:
+            self._last = key
+            self.ov.geometry(f"{aw}x{ah}+{ax}+{ay}")
+            self.cv.delete("all")
+            pal = PALETTE[a.mode]
+            if r:
+                p = 6
+                x0, y0, x1, y1 = r[0] - ax - p, r[1] - ay - p, r[2] - ax + p, r[3] - ay + p
+                self.cv.create_rectangle(x0 - 3, y0 - 3, x1 + 3, y1 + 3, fill=pal["accent"], outline="")
+                self.cv.create_rectangle(x0, y0, x1, y1, fill=self.HOLE, outline="")
+        # подсказку ставим на место каждый раз: окно могло ещё не показаться при прошлой попытке
+        self.box.update_idletasks()
+        bw, bh = self.box.winfo_reqwidth(), self.box.winfo_reqheight()
+        if not r:
+            bx, by = ax + (aw - bw) // 2, ay + (ah - bh) // 2
+        else:
+            gap = 18
+            if r[3] + gap + bh < ay + ah - 8:
+                by = r[3] + gap
+            elif r[1] - gap - bh > ay + 8:
+                by = r[1] - gap - bh
+            else:                                   # цель огромная — подсказка поверх, у нижнего края цели
+                by = min(r[3], ay + ah) - bh - 24
+            bx = min(max(r[0], ax + 12), ax + aw - bw - 12)
+        if (self.box.winfo_x(), self.box.winfo_y()) != (bx, by) or force:
+            self.box.geometry(f"+{bx}+{by}")
+            self.box.lift()
+
+    def _nudge(self):
+        """Щелчок мимо подсветки — подсказка «моргает», чтобы было видно, куда смотреть."""
+        pal = PALETTE[self.app.mode]
+        self.card.configure(highlightbackground=pal["warn"])
+        self.app.after(350, lambda: self.alive and self.card.configure(highlightbackground=pal["accent"]))
+
+    # --- содержимое подсказки
+    def show(self, i):
+        self.i = i
+        step = self.steps[i]
+        a = self.app
+        pal = PALETTE[a.mode]
+        if step.get("on_enter"):
+            step["on_enter"]()
+        for w in self.box.winfo_children():
+            w.destroy()
+        self.card = tk.Frame(self.box, bg=pal["card"], highlightthickness=2, highlightbackground=pal["accent"])
+        self.card.pack()
+        inner = tk.Frame(self.card, bg=pal["card"])
+        inner.pack(padx=20, pady=16)
+        n = len(self.steps)
+        tk.Label(inner, text=f"Шаг {i + 1} из {n}" if 0 < i < n - 1 else "Обучение", bg=pal["card"],
+                 fg=pal["accent"], font=a.f_small).pack(anchor="w")
+        tk.Label(inner, text=step["title"], bg=pal["card"], fg=pal["text"], font=a.f_big,
+                 justify="left", wraplength=420).pack(anchor="w", pady=(2, 6))
+        tk.Label(inner, text=step["text"], bg=pal["card"], fg=pal["text"], font=a.f_norm,
+                 justify="left", wraplength=420).pack(anchor="w")
+        if step.get("wait"):
+            tk.Label(inner, text="👉  " + step.get("action", "Ждём ваше действие…"), bg=pal["card"],
+                     fg=pal["orange"], font=a.f_bold, justify="left", wraplength=420).pack(anchor="w", pady=(10, 0))
+        # полоска прогресса обучения
+        bar = tk.Canvas(inner, width=420, height=4, bg=pal["card"], highlightthickness=0)
+        bar.pack(anchor="w", pady=(14, 10))
+        bar.create_rectangle(0, 0, 420, 4, fill=pal["track"], outline="")
+        bar.create_rectangle(0, 0, int(420 * (i + 1) / n), 4, fill=pal["accent"], outline="")
+        btns = tk.Frame(inner, bg=pal["card"])
+        btns.pack(fill="x")
+        last = i == n - 1
+        acc = "Accent.TButton" if sv_ttk else "TButton"
+        if step.get("wait"):
+            ttk.Button(btns, text="Пропустить шаг", command=self.next).pack(side="right")
+        else:
+            ttk.Button(btns, text="Готово" if last else ("Начать" if i == 0 else "Далее"), style=acc,
+                       command=self.finish if last else self.next).pack(side="right")
+        if 0 < i:
+            ttk.Button(btns, text="Назад", command=self.back).pack(side="right", padx=(0, 8))
+        if not last:
+            close = tk.Label(btns, text="Закрыть обучение", bg=pal["card"], fg=pal["muted"], font=a.f_small,
+                             cursor="hand2")
+            close.pack(side="left", pady=(6, 0))
+            close.bind("<Button-1>", lambda e: self.finish())
+        self._last = None
+        self._layout(force=True)
+
+    # --- переходы
+    def event(self, name):
+        step = self.steps[self.i]
+        if step.get("wait") == name and (step.get("cond") is None or step["cond"]()):
+            i = self.i            # переходим, только если за это время шаг не сменился
+            self.app.after(400, lambda: self.alive and self.i == i and self.next())
+
+    def back(self):
+        self._no_auto = self.i - 1        # на шаг, куда вернулись, не перепрыгиваем автоматически
+        self.show(self.i - 1)
+
+    def next(self):
+        if not self.alive:
+            return
+        if self.i + 1 < len(self.steps):
+            self.show(self.i + 1)
+        else:
+            self.finish()
+
+    def finish(self):
+        if not self.alive:
+            return
+        self.alive = False
+        for w in (self.box, self.ov):
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+        self.app.unbind("<Escape>")
+        self.on_finish()
+
+
 # ---------------------------------------------------------------- главное окно
 class App(tk.Tk):
     def __init__(self):
@@ -1338,7 +1521,11 @@ class App(tk.Tk):
         ttk.Button(head, text="⭳  Экспорт в CSV", command=self.export_csv).pack(side="right", padx=8)
 
         # карточки дисков — в той же строке, что и заголовок (экономим высоту)
+        self.tour = None
+        self.tour_btn = ttk.Button(head, text="?  Обучение", command=self.start_tour)
+        self.tour_btn.pack(side="right", padx=(0, 8))
         drives_row = self._frame(head)
+        self.drives_row = drives_row
         drives_row.pack(side="right", padx=(0, 16))
         self.drive_cards, self.drive_health_lbl = {}, {}
         for d in list_drives():
@@ -1380,16 +1567,18 @@ class App(tk.Tk):
                                     textvariable=self.path_var, values=list_drives(), width=34)
         ttk.Button(self.path_box.master, text="Обзор…", command=self._browse).pack(side="left", padx=(8, 0))
         self.min_var = tk.StringVar(value="50")
-        self._field(top, "Большие файлы — от, МБ", ttk.Spinbox, from_=1, to=100000, increment=10,
-                    textvariable=self.min_var, width=8)
+        self.min_var_field = self._field(top, "Большие файлы — от, МБ", ttk.Spinbox, from_=1, to=100000,
+                                         increment=10, textvariable=self.min_var, width=8).master.master
         self.workers_var = tk.StringVar(value=str(default_workers()))
-        self.drive_label = self._field(top, "Процессов", ttk.Spinbox, from_=1, to=64,
-                                       textvariable=self.workers_var, width=5).caption
+        _wf = self._field(top, "Процессов", ttk.Spinbox, from_=1, to=64, textvariable=self.workers_var, width=5)
+        self.drive_label, self.workers_field = _wf.caption, _wf.master.master
         self.path_var.trace_add("write", lambda *a: self.after_idle(self._auto_workers))
+        self.path_var.trace_add("write", lambda *a: self._tour_event("path"))
         self.after_idle(self._auto_workers)
 
         # итоговые карточки
         stats = self._frame(root)
+        self.stats_row = stats
         stats.pack(fill="x", pady=(14, 10))
         self.stat = {}
         for key, title in (("total", "Просканировано"), ("files", "Файлов и папок"), ("big", "Большие файлы"),
@@ -1405,6 +1594,7 @@ class App(tk.Tk):
         self.stat["junk"][0].role = "orange"
 
         self.nb = ttk.Notebook(root)
+        self.nb.bind("<<NotebookTabChanged>>", lambda e: self._tour_event("tab"))
         self.nb.pack(fill="both", expand=True)
 
         # Вкладка: большие файлы
@@ -1435,6 +1625,7 @@ class App(tk.Tk):
         # Вкладка: дерево папок
         f2 = ttk.Frame(self.nb, padding=(12, 12, 12, 0))
         bar2 = self._panel(f2, pady=(0, 6))
+        self.dirs_panel = bar2
         db = ttk.Frame(bar2, style="Panel.TFrame")
         db.pack(side="right", anchor="s")
         ttk.Button(db, text="Показать списком", command=self.fill_dir_list, style="Accent.TButton" if sv_ttk else "TButton").pack(side="left", ipady=2)
@@ -1552,6 +1743,7 @@ class App(tk.Tk):
 
         # строка состояния
         bottom = self._frame(root)
+        self.bottom_bar = bottom
         bottom.pack(side="bottom", fill="x", pady=10, before=self.nb)
         self.progress = ttk.Progressbar(bottom, mode="indeterminate", length=220)
         self.progress.pack(side="left")
@@ -1623,6 +1815,7 @@ class App(tk.Tk):
         self.worker = threading.Thread(target=scan, args=(root, int(min_mb * 1024 * 1024), self.q, self.cancel, self._workers()),
                                        daemon=True)
         self.worker.start()
+        self._tour_event("scan_start")
 
     def _workers(self):
         try:
@@ -1675,6 +1868,7 @@ class App(tk.Tk):
     def _scan_done(self, r):
         self._finish_ui()
         self.result = r
+        self.after(300, lambda: self._tour_event("scan_done"))
         note = " (остановлено — результаты неполные)" if r.cancelled else ""
         self.status.config(text=(f"Готово{note}: {r.files:,} файлов, {human(r.total)} за {r.seconds:.1f} с "
                                  f"({self._workers()} проц.). "
@@ -1912,6 +2106,13 @@ class App(tk.Tk):
                     lb.configure(text=text)
         self._recolor()
         if alert and problems:
+            if self.tour is not None:
+                self._pending_health_alert = problems      # покажем после обучения
+                return
+            self._show_health_alert(problems)
+
+    def _show_health_alert(self, problems):
+        if True:
             worst = any(d["level"] == "bad" for d in problems)
             parts = []
             for d in problems:
@@ -1923,6 +2124,109 @@ class App(tk.Tk):
                    "Подробности — на вкладке «Здоровье дисков».")
             (messagebox.showerror if worst else messagebox.showwarning)("Проверьте диски", msg, parent=self)
             self.nb.select(self.health_tab)
+
+    # ---------- обучение
+    def _tour_event(self, name):
+        if self.tour is not None:
+            self.tour.event(name)
+
+    def _tab_rect(self, index=None):
+        """Прямоугольник полосы вкладок или одной вкладки (в экранных координатах)."""
+        nb = self.nb
+        x0, y0 = nb.winfo_rootx(), nb.winfo_rooty()
+        pane = nb.nametowidget(nb.select())
+        y1 = pane.winfo_rooty()
+        if index is None:
+            return (x0, y0, x0 + nb.winfo_width(), y1)
+        ymid = (y1 - y0) // 2
+        xs = []
+        for x in range(0, nb.winfo_width(), 5):
+            try:
+                if nb.index(f"@{x},{ymid}") == index:
+                    xs.append(x)
+            except tk.TclError:
+                pass
+        if not xs:
+            return (x0, y0, x0 + nb.winfo_width(), y1)
+        return (x0 + xs[0], y0 + 2, x0 + xs[-1] + 5, y1)
+
+    def start_tour(self):
+        if self.tour is not None:
+            return
+        self.nb.select(0)
+        tab = lambda n: (lambda: self.nb.index("current") == n)
+        scanning = lambda: str(self.scan_btn.cget("state")) == "disabled"
+        steps = [
+            dict(target=None, title="Добро пожаловать в DiskCleaner 👋",
+                 text="Программа помогает понять, что занимает место на компьютере: находит большие файлы, "
+                      "тяжёлые папки, мусор и дубликаты, а ещё следит за здоровьем дисков.\n\n"
+                      "Давайте за пару минут пройдём по основным шагам. Обучение можно закрыть в любой момент "
+                      "и пройти снова кнопкой «? Обучение»."),
+            dict(target=lambda: self.drives_row, title="Ваши диски",
+                 text="Здесь видно, сколько места свободно на каждом диске, его тип (SSD или HDD) и состояние.",
+                 wait="path", action="Щёлкните по карточке диска, который хотите проверить."),
+            dict(target=lambda: self.path_box.master.master, title="Где искать",
+                 text="Выбранный диск появился здесь. Вместо целого диска можно указать любую папку — "
+                      "через «Обзор…» или вписав путь вручную."),
+            dict(target=lambda: [self.min_var_field, self.workers_field], title="Настройки поиска",
+                 text="«Большие файлы — от» — с какого размера файл попадёт в список больших.\n"
+                      "«Процессов» — сколько ядер процессора задействовать. Подбирается само: для SSD — "
+                      "по числу ядер, для HDD — 2, потому что жёсткому диску параллельное чтение только мешает."),
+            dict(target=lambda: self.scan_btn, title="Запускаем поиск", wait="scan_start",
+                 text="Сканирование только читает информацию о файлах и ничего не меняет на диске.",
+                 action="Нажмите «Сканировать»."),
+            dict(target=lambda: self.bottom_bar, title="Идёт сканирование…", wait="scan_done",
+                 cond_auto=lambda: self.result is not None and not scanning(),
+                 text="Внизу видно, сколько файлов уже найдено и какая папка проверяется. "
+                      "Если нужно прервать — есть кнопка «Стоп». Обычно это занимает от нескольких секунд "
+                      "до пары минут.",
+                 action="Дождитесь окончания — мастер продолжит сам."),
+            dict(target=lambda: self.stats_row, title="Итоги",
+                 text="Сколько просканировано, сколько файлов, сколько больших файлов и мусора, и за какое время."),
+            dict(target=lambda: self.t_files, title="Большие файлы", on_enter=lambda: self.nb.select(0),
+                 text="Самые крупные файлы — сверху. Размеры больше 1 ГБ подсвечены оранжевым, больше 10 ГБ — "
+                      "красным.\n\nДвойной щелчок — показать файл в Проводнике. Правая кнопка — меню: открыть, "
+                      "скопировать путь, скрыть папку, удалить в Корзину. Сверху — фильтры по имени, давности "
+                      "и папкам."),
+            dict(target=lambda: self._tab_rect(1), title="Папки", wait="tab", cond=tab(1), cond_auto=tab(1),
+                 text="На вкладке «Папки» видно, какие папки весят больше всего.",
+                 action="Откройте вкладку «Папки»."),
+            dict(target=lambda: [self.dirs_panel, self.dirtree if self.dirtree.winfo_ismapped() else self.t_dirs],
+                 title="Дерево и поиск папок", on_enter=lambda: self.nb.select(1),
+                 text="Дерево показывает папки от самых тяжёлых, с полоской доли. Раскрывайте их, чтобы найти, "
+                      "куда ушло место.\n\nСверху можно найти папку по имени, например «Fortnite», и нажать "
+                      "«Показать списком» — тогда видно, сколько она весит целиком."),
+            dict(target=lambda: self._tab_rect(2), title="Мусор", wait="tab", cond=tab(2), cond_auto=tab(2),
+                 text="Программа собирает кандидатов на удаление: временные файлы, логи, дампы, кэши, "
+                      "пустые папки.", action="Откройте вкладку «Мусор»."),
+            dict(target=lambda: self.t_junk, title="Проверяйте перед удалением", on_enter=lambda: self.nb.select(2),
+                 text="Это только подсказки — программа не знает, что важно лично вам. Выделите ненужное и "
+                      "нажмите Delete или «Удалить в Корзину» в меню правой кнопки. Всё уходит в Корзину, "
+                      "откуда можно восстановить.\n\nНа вкладке «Дубликаты» так же ищутся одинаковые файлы."),
+            dict(target=lambda: self._tab_rect(5), title="Здоровье дисков", wait="tab", cond=tab(5),
+                 cond_auto=tab(5),
+                 text="Программа читает SMART и предупреждает, если диск начинает сдавать.",
+                 action="Откройте вкладку «Здоровье дисков»."),
+            dict(target=lambda: self.h_canvas, title="Состояние дисков", on_enter=lambda: self.nb.select(5),
+                 text="Ресурс SSD с прогнозом, температура, наработка, ошибки. Кнопка «SMART — подробно» "
+                      "открывает полную таблицу атрибутов.\n\nЕсли с диском что-то не так, программа сама "
+                      "предупредит при запуске — тогда сразу сделайте резервную копию."),
+            dict(target=None, title="Готово! 🎉",
+                 text="Вы знаете всё необходимое. Помните: удаление — под вашу ответственность, а важные данные "
+                      "лучше держать в резервной копии.\n\nОбучение всегда можно пройти снова кнопкой "
+                      "«? Обучение» вверху окна."),
+        ]
+        self.tour = Tour(self, steps, self._tour_finished)
+
+    def _tour_finished(self):
+        self.tour = None
+        st = load_settings()
+        st["tour_done"] = True
+        save_settings(st)
+        pending = getattr(self, "_pending_health_alert", None)
+        if pending:
+            self._pending_health_alert = None
+            self.after(300, lambda: self._show_health_alert(pending))
 
     def show_smart(self, d):
         pal = PALETTE[self.mode]
@@ -2228,6 +2532,8 @@ if __name__ == "__main__":
     app = App()
     app.update()
     if app.ask_disclaimer():
+        if not load_settings().get("tour_done"):
+            app.after(500, app.start_tour)
         app.start_health(alert=True)
         app.mainloop()
     else:
