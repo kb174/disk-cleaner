@@ -5,6 +5,7 @@
 Ничего не удаляет само — только по вашей команде и только в Корзину.
 """
 import os
+import struct
 import sys
 import time
 import csv
@@ -19,6 +20,13 @@ from collections import defaultdict
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import tkinter.font as tkfont
+import shutil
+
+try:
+    import sv_ttk            # тема Sun Valley — внешний вид Windows 11
+except ImportError:
+    sv_ttk = None
 
 IS_WIN = os.name == "nt"
 FILE_ATTRIBUTE_REPARSE_POINT = 0x400
@@ -77,6 +85,38 @@ def junk_category(name_lower):
     return None
 
 
+# ---------------------------------------------------------------- оформление
+PALETTE = {
+    "light": dict(card="#ffffff", border="#e2e2e2", text="#1b1b1b", muted="#6b6b6b", accent="#005fb8",
+                  track="#e5e5e5", warn="#c42b1c", orange="#b35900", ok="#0f7b0f", stripe="#f5f5f5",
+                  panel="#ececec"),
+    "dark": dict(card="#2b2b2b", border="#3a3a3a", text="#f2f2f2", muted="#a3a3a3", accent="#60cdff",
+                 track="#454545", warn="#ff99a4", orange="#ffb86b", ok="#6ccb5f", stripe="#232323",
+                 panel="#242424"),
+}
+GB = 1 << 30
+
+
+def windows_prefers_dark():
+    try:
+        import winreg
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                           r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+        return winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
+    except Exception:
+        return False
+
+
+def pct_bar(p, width=10):
+    """Текстовая полоска доли: ███████░░░ 68.2 %"""
+    n = max(0, min(width * 2, round(p * width * 2 / 100)))
+    return f"{p:5.1f} %   " + "█" * (n // 2) + ("▌" if n % 2 else "")
+
+
+def size_tag(size):
+    return "huge" if size >= 10 * GB else ("big" if size >= GB else "")
+
+
 def human(n):
     n = float(n)
     for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
@@ -96,6 +136,475 @@ def list_drives():
     if not IS_WIN:
         return ["/"]
     return [f"{d}:\\" for d in string.ascii_uppercase if os.path.exists(f"{d}:\\")]
+
+
+# ---------------------------------------------------------------- ответственность и настройки
+APP_VERSION = "1.1"
+DISCLAIMER = (
+    "DiskCleaner показывает, что занимает место на диске, и помогает удалять ненужное.\n\n"
+    "Программа предоставляется «как есть», без каких-либо гарантий. Списки «Мусор» и «Дубликаты» — "
+    "только подсказки: программа не знает, что важно лично вам, и может ошибаться.\n\n"
+    "Все решения об удалении принимаете вы, и вы несёте за них ответственность. Автор программы "
+    "не отвечает за потерю данных, сбои Windows или программ, вызванные удалением файлов.\n\n"
+    "Перед удалением проверяйте, что это за файл. Не удаляйте системные папки (Windows, Program Files, "
+    "ProgramData, AppData), если не уверены. Удалённое попадает в Корзину — пока она не очищена, "
+    "файлы можно восстановить. Важные данные храните в резервной копии."
+)
+
+
+def settings_path():
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(base, "DiskCleaner", "settings.json")
+
+
+def load_settings():
+    import json
+    try:
+        with open(settings_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(data):
+    import json
+    try:
+        os.makedirs(os.path.dirname(settings_path()), exist_ok=True)
+        with open(settings_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+def _system_roots():
+    env = os.environ
+    roots = [env.get("SystemRoot", r"C:\Windows"), env.get("ProgramFiles", r"C:\Program Files"),
+             env.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), env.get("ProgramData", r"C:\ProgramData"),
+             env.get("APPDATA", ""), env.get("LOCALAPPDATA", ""),
+             os.path.join(os.path.splitdrive(env.get("SystemRoot", "C:"))[0] + "\\", "$Recycle.Bin"),
+             os.path.join(os.path.splitdrive(env.get("SystemRoot", "C:"))[0] + "\\", "Recovery"),
+             os.path.join(os.path.splitdrive(env.get("SystemRoot", "C:"))[0] + "\\", "Boot")]
+    return [os.path.normcase(os.path.abspath(r)) for r in roots if r]
+
+
+def is_risky_path(p):
+    """Системные папки, файлы программ, корень диска, папка профиля целиком."""
+    n = os.path.normcase(os.path.abspath(p))
+    for tmp in {os.environ.get("TEMP", ""), os.environ.get("TMP", "")}:
+        t = os.path.normcase(os.path.abspath(tmp)) if tmp else ""
+        if t and n.startswith(t + os.sep):                # содержимое Temp — обычный мусор, не система
+            return False
+    if os.path.dirname(n) == n:                       # корень диска
+        return True
+    home = os.path.normcase(os.path.expanduser("~"))
+    if n == home or n == os.path.dirname(home):         # весь профиль или папка Users
+        return True
+    return any(n == r or n.startswith(r + os.sep) for r in _system_roots())
+
+
+# ---------------------------------------------------------------- здоровье дисков (SMART)
+# Всё читается через IOCTL с доступом 0 («только запросы к устройству») — права администратора не нужны.
+BUS_NAMES = {1: "SCSI", 3: "ATA", 7: "USB", 8: "RAID", 10: "SAS", 11: "SATA", 12: "SD", 13: "MMC",
+             16: "Storage Spaces", 17: "NVMe", 19: "UFS"}
+ATA_WEAR_ATTRS = (231, 233, 202, 177, 169)      # нормализованное значение ≈ оставшийся ресурс SSD, %
+
+
+ATA_NAMES = {
+    1: "Ошибки чтения (частота)", 2: "Производительность обмена", 3: "Время раскрутки", 4: "Запусков/остановок",
+    5: "Переназначенные сектора", 7: "Ошибки позиционирования", 8: "Скорость позиционирования",
+    9: "Наработка, ч", 10: "Повторы раскрутки", 11: "Повторы калибровки", 12: "Включений питания",
+    13: "Программные ошибки чтения", 160: "Неисправимые секторы (чтение)", 161: "Годные блоки",
+    163: "Начальные плохие блоки", 164: "Всего стираний", 165: "Макс. стираний блока", 166: "Мин. стираний блока",
+    167: "Среднее стираний блока", 168: "Ошибки PHY SATA", 169: "Остаток ресурса", 170: "Резервные блоки",
+    171: "Ошибки программирования", 172: "Ошибки стирания", 173: "Выравнивание износа",
+    174: "Внезапные отключения питания", 175: "Ошибки программирования (чип)", 176: "Ошибки стирания (чип)",
+    177: "Выравнивание износа", 178: "Использовано резервных блоков (чип)", 179: "Использовано резервных блоков",
+    180: "Неиспользованные резервные блоки", 181: "Ошибки программирования (всего)", 182: "Ошибки стирания (всего)",
+    183: "Плохие блоки в работе / понижение SATA", 184: "Ошибки сквозной проверки", 187: "Неисправимые ошибки",
+    188: "Таймауты команд", 189: "Запись с высоты полёта", 190: "Температура воздушного потока",
+    191: "Ошибки от ударов", 192: "Аварийные парковки головок", 193: "Циклы загрузки/выгрузки головок",
+    194: "Температура", 195: "Исправлено ECC", 196: "События переназначения", 197: "Нестабильные сектора",
+    198: "Неисправимые сектора", 199: "Ошибки CRC (кабель)", 200: "Ошибки записи", 201: "Программные ошибки",
+    202: "Остаток ресурса", 206: "Высота полёта головок", 210: "Ошибки RAIN", 220: "Смещение пластин",
+    222: "Часы с загруженными головками", 223: "Повторы загрузки головок", 225: "Циклы загрузки головок",
+    226: "Время загрузки головок", 230: "Амплитуда головок / защита ресурса", 231: "Остаток ресурса SSD",
+    232: "Резерв ресурса", 233: "Износ носителя", 234: "Среднее/макс. стираний", 235: "Годные блоки / отключения",
+    240: "Часы полёта головок", 241: "Всего записано (LBA)", 242: "Всего прочитано (LBA)",
+    243: "Записано (LBA, старшая часть)", 244: "Прочитано (LBA, старшая часть)", 246: "Всего записано хостом",
+    247: "Страниц записано хостом", 248: "Страниц записано FTL", 249: "Записано в NAND, ГБ",
+    250: "Повторы чтения", 251: "Остаток ресурса (мин.)", 252: "Сбросы после плохих блоков",
+    254: "Защита от падения",
+}
+ATA_CRITICAL = {5, 10, 184, 187, 188, 196, 197, 198, 201}
+
+
+def smart_rows(d):
+    """Строки для окна SMART: (ID, название, текущее, худшее, порог, raw, состояние, уровень)."""
+    rows = []
+    if d.get("nvme"):
+        nv = d["nvme"]
+        cw = nv["crit_warning"]
+        bits = ["резерв ниже порога", "температура", "надёжность снижена", "только чтение", "резервное питание"]
+        cw_text = ", ".join(b for i, b in enumerate(bits) if cw >> i & 1) or "нет"
+        u = lambda n: f"{n:,}".replace(",", " ")
+        items = [
+            ("01", "Критические предупреждения", cw_text, "bad" if cw else ""),
+            ("02", "Температура (общая)", f"{nv['temp']} °C", "warn" if nv["temp"] >= 70 else ""),
+            ("03", "Доступный резерв", f"{nv['spare']} %", "bad" if nv["spare"] < nv["spare_thr"] else ""),
+            ("04", "Порог резерва", f"{nv['spare_thr']} %", ""),
+            ("05", "Израсходовано ресурса", f"{nv['used']} %", "bad" if nv["used"] >= 100 else
+             ("warn" if nv["used"] >= 90 else "")),
+            ("06", "Прочитано", f"{tb(nv['read_bytes'])}  ({u(nv['read_units'])} × 512 000 байт)", ""),
+            ("07", "Записано", f"{tb(nv['written_bytes'])}  ({u(nv['written_units'])} × 512 000 байт)", ""),
+            ("08", "Команд чтения", u(nv["host_reads"]), ""),
+            ("09", "Команд записи", u(nv["host_writes"]), ""),
+            ("0A", "Время под нагрузкой", f"{u(nv['busy_min'])} мин", ""),
+            ("0B", "Включений питания", u(nv["power_cycles"]), ""),
+            ("0C", "Наработка", f"{u(nv['hours'])} ч", ""),
+            ("0D", "Аварийных выключений", u(nv["unsafe_shutdowns"]), ""),
+            ("0E", "Ошибки носителя и целостности", u(nv["media_errors"]), "warn" if nv["media_errors"] else ""),
+            ("0F", "Записей в журнале ошибок", u(nv["err_log"]), ""),
+            ("10", "Время выше порога предупреждения", f"{u(nv['warn_temp_min'])} мин", ""),
+            ("11", "Время выше критической температуры", f"{u(nv['crit_temp_min'])} мин",
+             "warn" if nv["crit_temp_min"] else ""),
+        ]
+        for i, t in enumerate(nv.get("sensors", []), 1):
+            items.append((f"S{i}", f"Датчик температуры {i}", f"{t} °C", ""))
+        for aid, name, val, lvl in items:
+            rows.append((aid, name, "", "", "", val, "", lvl))
+    elif d.get("ata"):
+        thr = d.get("thresholds", {})
+        for aid in sorted(d["ata"]):
+            cur, worst, raw = d["ata"][aid]
+            t = thr.get(aid)
+            lvl, state = "", "OK"
+            if t and cur <= t:
+                lvl, state = "bad", "ОТКАЗ (ниже порога)"
+            elif aid in ATA_CRITICAL and raw:
+                lvl, state = "warn", "внимание"
+            elif aid == 199 and raw:
+                lvl, state = "warn", "проверьте кабель"
+            raw_s = f"{raw:,}".replace(",", " ")
+            if aid in (190, 194):
+                raw_s = f"{raw & 0xFF} °C   (0x{raw:012X})"
+            else:
+                raw_s += f"   (0x{raw:012X})"
+            rows.append((f"{aid:02X}", ATA_NAMES.get(aid, "Производитель"), cur, worst,
+                         t if t is not None else "—", raw_s, state, lvl))
+    return rows
+
+
+def smart_report(d):
+    lines = [f"{d['model']}   {d.get('serial', '')}",
+             f"{d['bus']} · {('SSD' if d.get('ssd') else 'HDD') if d.get('ssd') is not None else ''} · "
+             f"{human(d['size']) if d.get('size') else ''} · {', '.join(d.get('letters', []))}",
+             f"Состояние: {d.get('level')}  ·  источник: {d.get('source') or '—'}", ""]
+    for r in smart_rows(d):
+        aid, name, cur, worst, thr, raw, state, _ = r
+        if d.get("nvme"):
+            lines.append(f"{aid:>3}  {name:<38} {raw}")
+        else:
+            lines.append(f"{aid:>3}  {name:<38} {cur!s:>4} {worst!s:>4} {thr!s:>4}  {raw:<32} {state}")
+    return "\n".join(lines)
+
+
+def is_admin():
+    if not IS_WIN:
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _win_io():
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    k32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                    ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    k32.CloseHandle.argtypes = [wintypes.HANDLE]
+    invalid = wintypes.HANDLE(-1).value
+
+    def open_dev(path, access=0):
+        h = k32.CreateFileW(path, access, 3, None, 3, 0, None)   # FILE_SHARE_READ|WRITE, OPEN_EXISTING
+        return None if (not h or h == invalid) else h
+
+    def ioctl(h, code, inbuf=b"", outsize=512):
+        size = max(len(inbuf), outsize)
+        buf = ctypes.create_string_buffer(inbuf, size) if inbuf else ctypes.create_string_buffer(size)
+        ret = wintypes.DWORD()
+        ok = k32.DeviceIoControl(h, code, buf if inbuf else None, len(inbuf), buf, size, ctypes.byref(ret), None)
+        return buf.raw[:ret.value] if ok else None
+
+    return open_dev, ioctl, k32.CloseHandle
+
+
+IOCTL_STORAGE_QUERY_PROPERTY = 0x2D1400
+IOCTL_STORAGE_PREDICT_FAILURE = 0x2D1100
+IOCTL_STORAGE_GET_DEVICE_NUMBER = 0x2D1080
+IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x700A0
+SMART_RCV_DRIVE_DATA = 0x7C088
+
+
+def _query(ioctl, h, prop_id, outsize=1024, extra=b""):
+    return ioctl(h, IOCTL_STORAGE_QUERY_PROPERTY, struct.pack("<II", prop_id, 0) + (extra or b"\0\0\0\0"), outsize)
+
+
+def parse_ata_smart(data):
+    """512 байт SMART READ DATA -> {id: (нормализованное, худшее, raw)}"""
+    attrs = {}
+    if not data or len(data) < 362:
+        return attrs
+    for i in range(30):
+        o = 2 + i * 12
+        aid = data[o]
+        if aid == 0:
+            continue
+        attrs[aid] = (data[o + 3], data[o + 4], int.from_bytes(data[o + 5:o + 11], "little"))
+    return attrs
+
+
+def parse_nvme_health(d):
+    u128 = lambda o: int.from_bytes(d[o:o + 16], "little")
+    sensors = [struct.unpack_from("<H", d, 200 + 2 * i)[0] for i in range(8)]
+    return dict(crit_warning=d[0], temp=struct.unpack_from("<H", d, 1)[0] - 273, spare=d[3], spare_thr=d[4],
+                used=d[5], read_units=u128(32), written_units=u128(48),
+                read_bytes=u128(32) * 512000, written_bytes=u128(48) * 512000,
+                host_reads=u128(64), host_writes=u128(80), busy_min=u128(96),
+                power_cycles=u128(112), hours=u128(128), unsafe_shutdowns=u128(144),
+                media_errors=u128(160), err_log=u128(176),
+                warn_temp_min=struct.unpack_from("<I", d, 192)[0], crit_temp_min=struct.unpack_from("<I", d, 196)[0],
+                sensors=[t - 273 for t in sensors if t])
+
+
+def _read_disk(n, open_dev, ioctl, close):
+    h = open_dev(f"\\\\.\\PhysicalDrive{n}")
+    if h is None:
+        return None
+    d = dict(index=n, model=f"Диск {n}", bus="?", size=0, ssd=None, temp=None, letters=[],
+             nvme=None, ata=None, predict_failure=None, source="")
+    try:
+        desc = _query(ioctl, h, 0)                                   # StorageDeviceProperty
+        if desc and len(desc) >= 36:
+            v_off, p_off, _, s_off, bus = struct.unpack_from("<IIIII", desc, 12)
+
+            def sz(off):
+                if not off or off >= len(desc):
+                    return ""
+                return desc[off:desc.index(b"\0", off) if b"\0" in desc[off:] else len(desc)].decode("ascii", "ignore").strip()
+            d["model"] = " ".join(x for x in (sz(v_off), sz(p_off)) if x) or d["model"]
+            d["serial"] = sz(s_off).rstrip(".").strip()
+            d["bus"] = BUS_NAMES.get(bus, str(bus))
+        geo = ioctl(h, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, b"", 256)
+        if geo and len(geo) >= 32:
+            d["size"] = struct.unpack_from("<q", geo, 24)[0]
+        seek = _query(ioctl, h, 7, 16)                               # StorageDeviceSeekPenaltyProperty
+        if seek and len(seek) >= 9:
+            d["ssd"] = not seek[8]
+        t = _query(ioctl, h, 51, 256)                                # StorageDeviceTemperatureProperty
+        if t and len(t) >= 28 and struct.unpack_from("<H", t, 12)[0] > 0:
+            val = struct.unpack_from("<h", t, 26)[0]
+            if -40 < val < 150:
+                d["temp"] = val
+        if d["bus"] == "NVMe":
+            # StorageDeviceProtocolSpecificProperty: NVMe, LogPage, Health Information (0x02)
+            spec = struct.pack("<10I", 3, 2, 2, 0, 40, 512, 0, 0, 0, 0)
+            r = ioctl(h, IOCTL_STORAGE_QUERY_PROPERTY, struct.pack("<II", 50, 0) + spec + b"\0" * 512, 8 + 40 + 512)
+            if r and len(r) >= 8 + 40 + 512:
+                off = struct.unpack_from("<I", r, 8 + 16)[0]
+                d["nvme"] = parse_nvme_health(r[8 + off: 8 + off + 512])
+                d["source"] = "журнал здоровья NVMe"
+        else:
+            pf = ioctl(h, IOCTL_STORAGE_PREDICT_FAILURE, b"", 516)    # PredictFailure + 512 байт SMART
+            if pf and len(pf) >= 516:
+                d["predict_failure"] = bool(struct.unpack_from("<I", pf, 0)[0])
+                attrs = parse_ata_smart(pf[4:])
+                if attrs:
+                    d["ata"] = attrs
+                    d["source"] = "SMART (через прогноз отказа)"
+    finally:
+        close(h)
+    if d["bus"] != "NVMe" and is_admin():
+        _read_ata_admin(n, d, open_dev, ioctl, close)
+    return d
+
+
+def _read_ata_admin(n, d, open_dev, ioctl, close):
+    """Классический SMART READ DATA — требует прав администратора (доступ на чтение и запись)."""
+    h = open_dev(f"\\\\.\\PhysicalDrive{n}", 0xC0000000)
+    if h is None:
+        return
+    try:
+        # SENDCMDINPARAMS: cBufferSize, IDEREGS(Features=0xD0 READ DATA, Count=1, Number=1, CylLow=0x4F,
+        #                  CylHigh=0xC2, DriveHead=0xA0, Command=0xB0), bDriveNumber, reserved
+        inp = struct.pack("<I8BB3x4I", 512, 0xD0, 1, 1, 0x4F, 0xC2, 0xA0, 0xB0, 0, 0, 0, 0, 0, 0) + b"\0"
+        if not d.get("ata"):
+            r = ioctl(h, SMART_RCV_DRIVE_DATA, inp, 16 + 512)
+            if r and len(r) >= 16 + 362:
+                attrs = parse_ata_smart(r[16:16 + 512])
+                if attrs:
+                    d["ata"] = attrs
+                    d["source"] = "SMART (права администратора)"
+        # READ THRESHOLDS (Features = 0xD1) — пороги отказа по каждому атрибуту
+        inp_t = inp[:4] + bytes([0xD1]) + inp[5:]
+        r = ioctl(h, SMART_RCV_DRIVE_DATA, inp_t, 16 + 512)
+        if r and len(r) >= 16 + 362:
+            thr = {}
+            for i in range(30):
+                o = 16 + 2 + i * 12
+                if r[o]:
+                    thr[r[o]] = r[o + 1]
+            if thr:
+                d["thresholds"] = thr
+    finally:
+        close(h)
+
+
+def read_disks_health():
+    if not IS_WIN:
+        return []
+    open_dev, ioctl, close = _win_io()
+    disks = []
+    for n in range(32):
+        try:
+            d = _read_disk(n, open_dev, ioctl, close)
+        except Exception:
+            d = None
+        if d:
+            disks.append(d)
+    by_num = {d["index"]: d for d in disks}
+    for letter in list_drives():
+        h = open_dev("\\\\.\\" + letter.rstrip("\\"))
+        if h is None:
+            continue
+        try:
+            r = ioctl(h, IOCTL_STORAGE_GET_DEVICE_NUMBER, b"", 12)
+            if r and len(r) >= 8:
+                num = struct.unpack_from("<I", r, 4)[0]
+                if num in by_num:
+                    by_num[num]["letters"].append(letter.rstrip("\\"))
+        finally:
+            close(h)
+    for d in disks:
+        evaluate_health(d)
+    return disks
+
+
+def tb(n):
+    """Десятичные терабайты — в них производители указывают ресурс записи (TBW)."""
+    return f"{n / 1e12:.1f} ТБ" if n >= 1e12 else f"{n / 1e9:.0f} ГБ"
+
+
+def plural_years(n):
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} год"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return f"{n} года"
+    return f"{n} лет"
+
+
+def evaluate_health(d):
+    """Выставляет d['level'] (good/warn/bad/unknown), d['life'], d['problems'], d['metrics'], d['forecast']."""
+    problems, metrics, life, level = [], [], None, "good"
+
+    def flag(lvl, text):
+        nonlocal level
+        problems.append((lvl, text))
+        if lvl == "bad" or (lvl == "warn" and level == "good"):
+            level = lvl
+
+    nv, ata = d.get("nvme"), d.get("ata")
+    hours = None
+    if nv:
+        life = max(0, 100 - nv["used"])
+        hours = nv["hours"]
+        temp = nv["temp"] if -40 < nv["temp"] < 150 else d.get("temp")
+        cw = nv["crit_warning"]
+        if cw & 1:
+            flag("bad", "Резервные ячейки почти закончились — диск может скоро отказать")
+        if cw & 2:
+            flag("warn", "Диск сообщает о перегреве или переохлаждении")
+        if cw & 4:
+            flag("bad", "Диск сообщает о снижении надёжности из-за ошибок носителя")
+        if cw & 8:
+            flag("bad", "Диск перешёл в режим «только чтение» — срочно скопируйте данные")
+        if cw & 16:
+            flag("warn", "Сбой резервного питания кэша")
+        if nv["used"] >= 100:
+            flag("bad", "Заявленный ресурс записи исчерпан")
+        elif nv["used"] >= 90:
+            flag("warn", f"Израсходовано {nv['used']} % ресурса записи")
+        if nv["spare"] < nv["spare_thr"]:
+            flag("bad", f"Резерв ячеек {nv['spare']} % — ниже порога {nv['spare_thr']} %")
+        elif nv["spare"] < 50:
+            flag("warn", f"Резерв ячеек снизился до {nv['spare']} %")
+        if nv["media_errors"]:
+            flag("warn", f"Ошибок носителя: {nv['media_errors']}")
+        metrics = [("Температура", f"{temp} °C" if temp is not None else "—"),
+                   ("Наработка", f"{nv['hours']:,} ч".replace(",", " ")),
+                   ("Включений", f"{nv['power_cycles']:,}".replace(",", " ")),
+                   ("Записано", tb(nv["written_bytes"])), ("Прочитано", tb(nv["read_bytes"])),
+                   ("Резерв ячеек", f"{nv['spare']} %"), ("Ошибки носителя", str(nv["media_errors"])),
+                   ("Аварийных выключений", f"{nv['unsafe_shutdowns']:,}".replace(",", " "))]
+    elif ata:
+        raw = lambda a: ata[a][2] if a in ata else None
+        temp_raw = raw(194) if 194 in ata else raw(190)
+        temp = (temp_raw & 0xFF) if temp_raw is not None else d.get("temp")
+        hours = (raw(9) & 0xFFFFFFFF) if 9 in ata else None
+        for a in ATA_WEAR_ATTRS:
+            if a in ata and 0 < ata[a][0] <= 100 and d.get("ssd"):
+                life = ata[a][0]
+                break
+        if d.get("predict_failure"):
+            flag("bad", "Диск сам предсказывает скорый отказ (SMART) — срочно скопируйте данные")
+        realloc, pending, uncorr = raw(5) or 0, raw(197) or 0, raw(198) or 0
+        if realloc:
+            flag("bad" if realloc >= 100 else "warn", f"Переназначено секторов: {realloc} — поверхность изнашивается")
+        if pending:
+            flag("bad" if pending >= 10 else "warn", f"Нестабильных секторов: {pending} — возможна потеря данных")
+        if uncorr:
+            flag("bad", f"Неисправимых секторов: {uncorr}")
+        if raw(187):
+            flag("warn", f"Неисправимых ошибок чтения: {raw(187)}")
+        if raw(10) and not d.get("ssd"):
+            flag("warn", f"Повторные попытки раскрутки: {raw(10)} — проблемы с механикой или питанием")
+        if raw(199):
+            flag("warn", f"Ошибки передачи данных (CRC): {raw(199)} — проверьте SATA-кабель")
+        if life is not None and life <= 10:
+            flag("bad" if life <= 3 else "warn", f"Осталось {life} % ресурса SSD")
+        metrics = [("Температура", f"{temp} °C" if temp is not None else "—"),
+                   ("Наработка", f"{hours:,} ч".replace(",", " ") if hours is not None else "—"),
+                   ("Включений", f"{raw(12):,}".replace(",", " ") if 12 in ata else "—"),
+                   ("Переназначено", str(realloc)), ("Нестабильных", str(pending)),
+                   ("Неисправимых", str(uncorr)), ("Ошибки CRC", str(raw(199) or 0))]
+    else:
+        level = "unknown"
+        temp = d.get("temp")
+        if d.get("predict_failure"):
+            flag("bad", "Диск сам предсказывает скорый отказ (SMART)")
+        metrics = [("Температура", f"{temp} °C" if temp is not None else "—")]
+    hot = 70 if d.get("ssd") else 55
+    if temp is not None and temp >= hot:
+        flag("warn", f"Высокая температура: {temp} °C")
+    forecast = ""
+    if life is not None and hours and life < 100:
+        used = 100 - life
+        remain_h = hours * life / used
+        years = remain_h / (8 * 365)
+        if years > 15:
+            forecast = "Износ записью не станет проблемой ещё много лет (больше 15 при 8 ч работы в день)"
+        else:
+            forecast = (f"При нынешнем темпе ресурса хватит примерно на {remain_h / 1000:,.0f} тыс. часов работы "
+                        f"(≈ {plural_years(max(1, round(years)))} при 8 ч в день)").replace(",", " ")
+    elif life == 100:
+        forecast = "Износ пока не заметен"
+    d.update(level=level, life=life, problems=problems, metrics=metrics, forecast=forecast)
+    return d
 
 
 # ---------------------------------------------------------------- удаление в Корзину
@@ -153,8 +662,81 @@ class ScanResult:
         self.parent = {}             # path -> родительская папка
 
 
+HDD_WORKERS = 2          # на HDD параллельное чтение гоняет головку туда-сюда — больше 2 только медленнее
+NETWORK_WORKERS = 4
+
+
 def default_workers():
     return max(1, min(16, os.cpu_count() or 4))
+
+
+_drive_cache = {}
+
+
+def drive_kind(path):
+    """Тип носителя, на котором лежит path: "SSD", "HDD", "USB", "Сеть" или None (не удалось определить).
+    Используется IOCTL_STORAGE_QUERY_PROPERTY / StorageDeviceSeekPenaltyProperty — работает без прав администратора."""
+    if not IS_WIN:
+        return None
+    drive = os.path.splitdrive(os.path.abspath(path))[0]
+    if not drive or drive.startswith("\\\\"):
+        return "Сеть" if drive else None
+    drive = drive.upper()
+    if drive in _drive_cache:
+        return _drive_cache[drive]
+    kind = None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        dtype = k32.GetDriveTypeW(drive + "\\")
+        if dtype == 4:            # DRIVE_REMOTE
+            kind = "Сеть"
+        else:
+            class STORAGE_PROPERTY_QUERY(ctypes.Structure):
+                _fields_ = [("PropertyId", wintypes.DWORD), ("QueryType", wintypes.DWORD),
+                            ("AdditionalParameters", ctypes.c_ubyte * 1)]
+
+            class DEVICE_SEEK_PENALTY_DESCRIPTOR(ctypes.Structure):
+                _fields_ = [("Version", wintypes.DWORD), ("Size", wintypes.DWORD),
+                            ("IncursSeekPenalty", ctypes.c_ubyte)]
+
+            k32.CreateFileW.restype = wintypes.HANDLE
+            k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+            k32.DeviceIoControl.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD,
+                                            ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+                                            ctypes.c_void_p]
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            # доступ 0 = только запросы к устройству, права администратора не нужны
+            h = k32.CreateFileW("\\\\.\\" + drive, 0, 3, None, 3, 0, None)   # FILE_SHARE_READ|WRITE, OPEN_EXISTING
+            if h and h != wintypes.HANDLE(-1).value:
+                try:
+                    q = STORAGE_PROPERTY_QUERY(7, 0)                    # StorageDeviceSeekPenaltyProperty, Standard
+                    out = DEVICE_SEEK_PENALTY_DESCRIPTOR()
+                    ret = wintypes.DWORD()
+                    ok = k32.DeviceIoControl(h, 0x2D1400, ctypes.byref(q), ctypes.sizeof(q),   # IOCTL_STORAGE_QUERY_PROPERTY
+                                             ctypes.byref(out), ctypes.sizeof(out), ctypes.byref(ret), None)
+                    if ok and ret.value >= 9:
+                        kind = "HDD" if out.IncursSeekPenalty else "SSD"
+                finally:
+                    k32.CloseHandle(h)
+            if kind is None and dtype == 2:                     # DRIVE_REMOVABLE (флешка)
+                kind = "USB"
+    except Exception:
+        kind = None
+    _drive_cache[drive] = kind
+    return kind
+
+
+def workers_for(path):
+    """Сколько процессов запускать: SSD — по числу ядер, HDD/флешка — 2, сеть — 4."""
+    kind = drive_kind(path)
+    if kind in ("HDD", "USB"):
+        return kind, HDD_WORKERS
+    if kind == "Сеть":
+        return kind, NETWORK_WORKERS
+    return kind, default_workers()
 
 
 class _WorkerState:
@@ -431,7 +1013,7 @@ class Table(ttk.Frame):
         ids = [c[0] for c in columns]
         self.tree = ttk.Treeview(self, columns=ids, show="headings", selectmode="extended")
         for cid, title, width, kind in columns:
-            anchor = "e" if kind in ("size", "int", "pct") else "w"
+            anchor = "e" if kind in ("size", "int") else "w"
             self.tree.heading(cid, text=title, command=lambda c=cid: self.sort_by(c))
             self.tree.column(cid, width=width, anchor=anchor, stretch=(kind == "text"))
         ys = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
@@ -459,12 +1041,14 @@ class Table(ttk.Frame):
                 elif k == "date":
                     vals.append(fmt_date(v))
                 elif k == "pct":
-                    vals.append(f"{v:.1f} %")
+                    vals.append(pct_bar(v))
                 elif k == "int":
                     vals.append(f"{v:,}".replace(",", " "))
                 else:
                     vals.append(v)
-            self.tree.insert("", "end", iid=str(i), values=vals)
+            size = next((v for v, k in zip(row, kinds) if k == "size"), 0)
+            self.tree.insert("", "end", iid=str(i), values=vals,
+                             tags=("odd" if i % 2 else "even", size_tag(size)))
 
     def sort_by(self, cid):
         idx = [c[0] for c in self.columns].index(cid)
@@ -493,100 +1077,387 @@ class Table(ttk.Frame):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Анализатор диска — большие файлы, папки и мусор")
-        self.geometry("1150x700")
-        self.minsize(800, 450)
+        self.title("DiskCleaner — анализатор диска")
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w, h = min(1280, sw - 60), min(820, sh - 90)
+        self.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+{max(0, (sh - h) // 2 - 20)}")
+        self.minsize(900, 560)
+        self.mode = "dark" if windows_prefers_dark() else "light"
+        self.cards, self.themed_labels, self.bars, self.plain_frames = [], [], [], []
+        if sv_ttk:
+            sv_ttk.set_theme(self.mode)
+        else:
+            try:
+                ttk.Style().theme_use("vista")
+            except tk.TclError:
+                pass
+            self.mode = "light"
+        self.f_title = tkfont.Font(family="Segoe UI Semibold", size=18)
+        self.f_big = tkfont.Font(family="Segoe UI Semibold", size=15)
+        self.f_bold = tkfont.Font(family="Segoe UI Semibold", size=10)
+        self.f_norm = tkfont.Font(family="Segoe UI", size=10)
+        self.f_small = tkfont.Font(family="Segoe UI", size=9)
+        self.f_field = tkfont.Font(family="Segoe UI", size=11)
         self.q = queue.Queue()
         self.cancel = threading.Event()
         self.result = None
         self.worker = None
         self._build()
+        self.apply_theme(self.mode)
         self.after(100, self._poll)
 
     # ---------- интерфейс
-    def _build(self):
-        top = ttk.Frame(self, padding=6)
-        top.pack(fill="x")
-        ttk.Label(top, text="Где искать:").pack(side="left")
-        self.path_var = tk.StringVar(value=list_drives()[0])
-        self.path_box = ttk.Combobox(top, textvariable=self.path_var, values=list_drives(), width=40)
-        self.path_box.pack(side="left", padx=4)
-        ttk.Button(top, text="Обзор…", command=self._browse).pack(side="left")
-        ttk.Label(top, text="   Файлы от (МБ):").pack(side="left")
-        self.min_var = tk.StringVar(value="50")
-        ttk.Spinbox(top, from_=1, to=100000, increment=10, textvariable=self.min_var, width=7).pack(side="left", padx=4)
-        ttk.Label(top, text="   Ядер:").pack(side="left")
-        self.workers_var = tk.StringVar(value=str(default_workers()))
-        ttk.Spinbox(top, from_=1, to=64, textvariable=self.workers_var, width=4).pack(side="left", padx=4)
-        self.scan_btn = ttk.Button(top, text="▶ Сканировать", command=self.start_scan)
-        self.scan_btn.pack(side="left", padx=(12, 4))
-        self.stop_btn = ttk.Button(top, text="■ Стоп", command=self.cancel.set, state="disabled")
-        self.stop_btn.pack(side="left")
-        ttk.Button(top, text="Экспорт в CSV", command=self.export_csv).pack(side="right")
+    # ---------- элементы оформления
+    def _frame(self, master, **kw):
+        f = tk.Frame(master, bd=0, **kw)
+        self.plain_frames.append(f)
+        return f
 
-        self.nb = ttk.Notebook(self)
-        self.nb.pack(fill="both", expand=True, padx=6)
+    def _label(self, master, text="", role="text", font=None, **kw):
+        # bg_role: None — фон окна или карточки (определяется автоматически), "panel" — подложка полей
+        """Метка на карточке: цвет берётся из палитры по роли (text/muted/accent/warn/ok)."""
+        lb = tk.Label(master, text=text, font=font or self.f_norm, bd=0, **kw)
+        lb.role = role
+        self.themed_labels.append(lb)
+        return lb
+
+    def _card(self, master, padx=14, pady=10):
+        outer = tk.Frame(master, bd=0, highlightthickness=1)
+        inner = tk.Frame(outer, bd=0)
+        inner.pack(fill="both", expand=True, padx=padx, pady=pady)
+        self.cards.append((outer, inner))
+        return outer, inner
+
+    def _panel(self, master, pady=(0, 0)):
+        """Подложка для полей ввода: чуть темнее фона, чтобы белые поля не сливались."""
+        p = ttk.Frame(master, style="Panel.TFrame", padding=(14, 10, 14, 12))
+        p.pack(fill="x", pady=pady)
+        return p
+
+    def _field(self, parent, label, widget_cls, expand=False, **kw):
+        """Поле с подписью сверху. Возвращает сам виджет ввода (его .master — рамка поля)."""
+        box = ttk.Frame(parent, style="Panel.TFrame")
+        box.pack(side="left", padx=(0, 16), fill="x", expand=expand, anchor="s")
+        cap = self._label(box, label, role="muted", font=self.f_small)
+        cap.bg_role = "panel"
+        cap.pack(anchor="w", pady=(0, 5))
+        row = ttk.Frame(box, style="Panel.TFrame")
+        row.pack(fill="x")
+        w = widget_cls(row, font=self.f_field, **kw)
+        w.pack(side="left", fill="x", expand=True, ipady=2)
+        w.caption = cap
+        return w
+
+    def _reset_file_filters(self):
+        self.filter_var.set("")
+        self.age_var.set("0")
+        self.exclude_var.set("")
+        self.fill_files()
+
+    def _bar(self, master, width=220, height=6):
+        c = tk.Canvas(master, width=width, height=height, bd=0, highlightthickness=0)
+        c.value, c.color = 0.0, "accent"
+        self.bars.append(c)
+        return c
+
+    def _draw_bar(self, c):
+        pal = PALETTE[self.mode]
+        w, h = int(c["width"]), int(c["height"])
+        c.delete("all")
+        c.configure(bg=pal["card"])
+        c.create_rectangle(0, 0, w, h, fill=pal["track"], outline="")
+        fill = max(0, min(w, int(w * c.value)))
+        if fill:
+            c.create_rectangle(0, 0, fill, h, fill=pal[c.color], outline="")
+
+    def apply_theme(self, mode):
+        self.mode = mode
+        if sv_ttk:
+            sv_ttk.set_theme(mode)
+        pal = PALETTE[mode]
+        style = ttk.Style()
+        base = style.lookup("TFrame", "background") or ("#fafafa" if mode == "light" else "#1c1c1c")
+        self.configure(bg=base)
+        style.configure("Treeview", rowheight=30, font=self.f_norm)
+        style.configure("Treeview.Heading", font=self.f_bold)
+        style.configure("TNotebook.Tab", font=self.f_norm, padding=(14, 6))
+        style.configure("Muted.TLabel", foreground=pal["muted"])
+        style.configure("Panel.TFrame", background=pal["panel"])
+        style.configure("PanelMuted.TLabel", background=pal["panel"], foreground=pal["muted"], font=self.f_small)
+        style.configure("Panel.TCheckbutton", background=pal["panel"])
+        for st in ("TEntry", "TSpinbox", "TCombobox"):
+            style.configure(st, padding=(10, 6, 10, 6))
+        self.option_add("*TCombobox*Listbox.font", self.f_field)
+        style.configure("Accent.TButton", font=self.f_bold)
+        self._recolor()
+        for t in self._all_trees():
+            t.tag_configure("odd", background=pal["stripe"])
+            t.tag_configure("huge", foreground=pal["warn"])
+            t.tag_configure("big", foreground=pal["orange"])
+            t.tag_configure("group", font=self.f_bold)
+        if hasattr(self, "theme_btn"):
+            self.theme_btn.configure(text="☀  Светлая тема" if mode == "dark" else "☾  Тёмная тема")
+        self._dark_titlebar(mode == "dark")
+
+    def _recolor(self):
+        """Перекрашивает «ручные» элементы (карточки, метки, полоски) под текущую палитру."""
+        pal = PALETTE[self.mode]
+        base = ttk.Style().lookup("TFrame", "background") or ("#fafafa" if self.mode == "light" else "#1c1c1c")
+        alive = lambda w: w.winfo_exists()
+        self.plain_frames = [f for f in self.plain_frames if alive(f)]
+        self.cards = [c for c in self.cards if alive(c[0])]
+        self.themed_labels = [l for l in self.themed_labels if alive(l)]
+        self.bars = [b for b in self.bars if alive(b)]
+        for f in self.plain_frames:
+            f.configure(bg=base)
+        for c in getattr(self, "plain_canvases", []):
+            c.configure(bg=base)
+        inners = set()
+
+        def paint(w):
+            for ch in w.winfo_children():
+                if isinstance(ch, tk.Frame):
+                    ch.configure(bg=pal["card"])
+                    paint(ch)
+        for outer, inner in self.cards:
+            outer.configure(bg=pal["card"], highlightbackground=pal["border"], highlightcolor=pal["border"])
+            inner.configure(bg=pal["card"])
+            paint(inner)
+            inners.add(str(inner))
+
+        def on_card(w):
+            p = w.master
+            while p is not None:
+                if str(p) in inners:
+                    return True
+                p = p.master
+            return False
+        for lb in self.themed_labels:
+            if getattr(lb, "pill", False):
+                lb.configure(bg=pal[lb.role], fg=pal["card"])
+                continue
+            if getattr(lb, "bg_role", None) == "panel":
+                bg = pal["panel"]
+            elif on_card(lb):
+                bg = pal["card"]
+            else:
+                bg = base
+            lb.configure(bg=bg, fg=pal[lb.role])
+        for c in self.bars:
+            self._draw_bar(c)
+
+    def ask_disclaimer(self):
+        """Окно ответственности при первом запуске. Возвращает True, если пользователь согласился."""
+        settings = load_settings()
+        if settings.get("accepted_disclaimer") == APP_VERSION:
+            return True
+        pal = PALETTE[self.mode]
+        dlg = tk.Toplevel(self)
+        dlg.title("Прежде чем начать")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        base = ttk.Style().lookup("TFrame", "background") or pal["card"]
+        dlg.configure(bg=base)
+        body = ttk.Frame(dlg, padding=(28, 24, 28, 20))
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text="⚠  Вы отвечаете за то, что удаляете", font=self.f_big, bg=base,
+                 fg=pal["orange"]).pack(anchor="w")
+        tk.Label(body, text=DISCLAIMER, font=self.f_norm, bg=base, fg=pal["text"], justify="left",
+                 wraplength=560).pack(anchor="w", pady=(14, 16))
+        agree = tk.BooleanVar(value=False)
+        result = {"ok": False}
+        btns = ttk.Frame(body)
+        btns.pack(fill="x", side="bottom")
+        ok_btn = ttk.Button(btns, text="Продолжить", state="disabled",
+                            style="Accent.TButton" if sv_ttk else "TButton", width=16)
+        ok_btn.pack(side="right")
+        ttk.Button(btns, text="Выйти", width=12, command=dlg.destroy).pack(side="right", padx=(0, 8))
+        ttk.Checkbutton(body, text="Я прочитал(а), понимаю риски и принимаю ответственность", variable=agree,
+                        command=lambda: ok_btn.configure(state="normal" if agree.get() else "disabled")
+                        ).pack(anchor="w", pady=(0, 18))
+
+        def accept():
+            result["ok"] = True
+            settings["accepted_disclaimer"] = APP_VERSION
+            save_settings(settings)
+            dlg.destroy()
+
+        ok_btn.configure(command=accept)
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        dlg.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dlg.winfo_width()) // 2
+        y = self.winfo_rooty() + max(40, (self.winfo_height() - dlg.winfo_height()) // 3)
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dlg.grab_set()
+        dlg.focus_force()
+        self.wait_window(dlg)
+        return result["ok"]
+
+    def show_disclaimer(self):
+        messagebox.showinfo("Ответственность", DISCLAIMER, parent=self)
+
+    def _all_trees(self):
+        return [w for w in (getattr(self, n, None) for n in ("dirtree", "duptree")) if w] + \
+               [t.tree for t in (getattr(self, n, None) for n in ("t_files", "t_dirs", "t_junk", "t_types")) if t]
+
+    def toggle_theme(self):
+        self.apply_theme("light" if self.mode == "dark" else "dark")
+
+    def _dark_titlebar(self, dark):
+        if not IS_WIN:
+            return
+        try:
+            import ctypes
+            self.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
+            val = ctypes.c_int(1 if dark else 0)
+            for attr in (20, 19):   # DWMWA_USE_IMMERSIVE_DARK_MODE (Win10 20H1+ / старые сборки)
+                if ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(val), ctypes.sizeof(val)) == 0:
+                    break
+            # Windows перерисовывает рамку только при изменении окна — «пошевелим» его на пиксель
+            w, h = self.winfo_width(), self.winfo_height()
+            if w > 1:
+                self.geometry(f"{w + 1}x{h}")
+                self.update_idletasks()
+                self.geometry(f"{w}x{h}")
+        except Exception:
+            pass
+
+    # ---------- интерфейс
+    def _build(self):
+        root = self._frame(self)
+        root.pack(fill="both", expand=True, padx=18, pady=(14, 0))
+
+        # шапка
+        head = self._frame(root)
+        head.pack(fill="x")
+        self._label(head, "DiskCleaner", font=self.f_title).pack(side="left")
+        self._label(head, "  анализатор диска", role="muted").pack(side="left", pady=(8, 0))
+        self.theme_btn = ttk.Button(head, text="", command=self.toggle_theme, width=16)
+        self.theme_btn.pack(side="right")
+        ttk.Button(head, text="⭳  Экспорт в CSV", command=self.export_csv).pack(side="right", padx=8)
+
+        # карточки дисков — в той же строке, что и заголовок (экономим высоту)
+        drives_row = self._frame(head)
+        drives_row.pack(side="right", padx=(0, 16))
+        self.drive_cards, self.drive_health_lbl = {}, {}
+        for d in list_drives():
+            try:
+                du = shutil.disk_usage(d)
+            except OSError:
+                continue
+            outer, inner = self._card(drives_row, padx=12, pady=7)
+            outer.pack(side="left", padx=(10, 0))
+            kind = drive_kind(d) or "диск"
+            top_line = tk.Frame(inner, bd=0)
+            top_line.pack(fill="x")
+            self._label(top_line, f"🖴  {d.rstrip(chr(92))}", font=self.f_bold).pack(side="left")
+            self._label(top_line, f"  {kind}", role="accent", font=self.f_small).pack(side="left")
+            bar = self._bar(inner, width=190, height=5)
+            bar.value = du.used / du.total if du.total else 0
+            bar.color = "warn" if bar.value > 0.9 else "accent"
+            bar.pack(fill="x", pady=(5, 4))
+            self._label(inner, f"свободно {human(du.free)} из {human(du.total)}", role="muted",
+                        font=self.f_small).pack(anchor="w")
+            for w in [outer, inner, top_line, bar] + list(inner.winfo_children()) + list(top_line.winfo_children()):
+                w.bind("<Button-1>", lambda e, d=d: self.path_var.set(d))
+                w.configure(cursor="hand2")
+            self.drive_cards[d] = outer
+            hl = self._label(top_line, "", role="muted", font=self.f_small)
+            hl.pack(side="right")
+            self.drive_health_lbl[d.rstrip("\\")] = hl
+
+        # панель запуска — на подложке, подписи над полями
+        top = self._panel(root, pady=(14, 0))
+        btns = ttk.Frame(top, style="Panel.TFrame")
+        btns.pack(side="right", anchor="s")
+        self.scan_btn = ttk.Button(btns, text="▶   Сканировать", command=self.start_scan, style="Accent.TButton" if sv_ttk else "TButton", width=18)
+        self.scan_btn.pack(side="left", ipady=3)
+        self.stop_btn = ttk.Button(btns, text="■  Стоп", command=self.cancel.set, state="disabled")
+        self.stop_btn.pack(side="left", padx=(8, 0), ipady=3)
+        self.path_var = tk.StringVar(value=list_drives()[0])
+        self.path_box = self._field(top, "Где искать — диск или папка", ttk.Combobox, expand=True,
+                                    textvariable=self.path_var, values=list_drives(), width=34)
+        ttk.Button(self.path_box.master, text="Обзор…", command=self._browse).pack(side="left", padx=(8, 0))
+        self.min_var = tk.StringVar(value="50")
+        self._field(top, "Большие файлы — от, МБ", ttk.Spinbox, from_=1, to=100000, increment=10,
+                    textvariable=self.min_var, width=8)
+        self.workers_var = tk.StringVar(value=str(default_workers()))
+        self.drive_label = self._field(top, "Процессов", ttk.Spinbox, from_=1, to=64,
+                                       textvariable=self.workers_var, width=5).caption
+        self.path_var.trace_add("write", lambda *a: self.after_idle(self._auto_workers))
+        self.after_idle(self._auto_workers)
+
+        # итоговые карточки
+        stats = self._frame(root)
+        stats.pack(fill="x", pady=(14, 10))
+        self.stat = {}
+        for key, title in (("total", "Просканировано"), ("files", "Файлов и папок"), ("big", "Большие файлы"),
+                           ("junk", "Мусор"), ("time", "Время")):
+            outer, inner = self._card(stats, padx=16, pady=10)
+            outer.pack(side="left", fill="x", expand=True, padx=(0, 10) if key != "time" else 0)
+            self._label(inner, title, role="muted", font=self.f_small).pack(anchor="w")
+            v = self._label(inner, "—", font=self.f_big)
+            v.pack(anchor="w")
+            sub = self._label(inner, " ", role="muted", font=self.f_small)
+            sub.pack(anchor="w")
+            self.stat[key] = (v, sub)
+        self.stat["junk"][0].role = "orange"
+
+        self.nb = ttk.Notebook(root)
+        self.nb.pack(fill="both", expand=True)
 
         # Вкладка: большие файлы
-        f1 = ttk.Frame(self.nb)
-        flt = ttk.Frame(f1, padding=(0, 4))
-        flt.pack(fill="x")
-        ttk.Label(flt, text="Фильтр по имени/пути:").pack(side="left")
+        f1 = ttk.Frame(self.nb, padding=(12, 12, 12, 0))
+        flt = self._panel(f1, pady=(0, 6))
+        fb = ttk.Frame(flt, style="Panel.TFrame")
+        fb.pack(side="right", anchor="s")
+        ttk.Button(fb, text="Применить", command=self.fill_files, style="Accent.TButton" if sv_ttk else "TButton").pack(side="left", ipady=2)
+        ttk.Button(fb, text="Сбросить", command=self._reset_file_filters).pack(side="left", padx=(8, 0), ipady=2)
         self.filter_var = tk.StringVar()
-        ttk.Entry(flt, textvariable=self.filter_var, width=30).pack(side="left", padx=4)
-        ttk.Label(flt, text="  не изменялись дней, не менее:").pack(side="left")
+        e_f = self._field(flt, "Поиск по имени или пути", ttk.Entry, textvariable=self.filter_var, width=26)
         self.age_var = tk.StringVar(value="0")
-        ttk.Spinbox(flt, from_=0, to=10000, increment=30, textvariable=self.age_var, width=6).pack(side="left", padx=4)
-        ttk.Button(flt, text="Применить", command=self.fill_files).pack(side="left", padx=4)
-        self.files_info = ttk.Label(flt, text="")
-        self.files_info.pack(side="left", padx=10)
-        flt2 = ttk.Frame(f1, padding=(0, 0, 0, 4))
-        flt2.pack(fill="x")
-        ttk.Label(flt2, text="Скрыть папки (через запятую):").pack(side="left")
+        e_a = self._field(flt, "Не изменялись, дней", ttk.Spinbox, from_=0, to=10000, increment=30,
+                          textvariable=self.age_var, width=7)
         self.exclude_var = tk.StringVar()
-        ex = ttk.Entry(flt2, textvariable=self.exclude_var, width=60)
-        ex.pack(side="left", padx=4, fill="x", expand=True)
-        ttk.Button(flt2, text="Очистить", command=lambda: (self.exclude_var.set(""), self.fill_files())).pack(side="left")
-        ttk.Label(flt2, text="  пример: Fortnite, Program Files, Windows", foreground="gray").pack(side="left")
-        for w in flt.winfo_children() + [ex]:
-            if isinstance(w, (ttk.Entry, ttk.Spinbox)):
-                w.bind("<Return>", lambda e: self.fill_files())
+        ex = self._field(flt, "Скрыть папки через запятую (например: Fortnite, Windows)", ttk.Entry, expand=True,
+                         textvariable=self.exclude_var, width=30)
+        for w in (e_f, e_a, ex):
+            w.bind("<Return>", lambda e: self.fill_files())
+        self.files_info = ttk.Label(f1, text="", style="Muted.TLabel")
+        self.files_info.pack(anchor="w", pady=(0, 6))
         self.t_files = Table(f1, [("size", "Размер", 90, "size"), ("name", "Имя", 260, "text"),
                                   ("ext", "Тип", 70, "text"), ("date", "Изменён", 120, "date"),
                                   ("dir", "Папка", 500, "text")], path_col=5)
         self.t_files.pack(fill="both", expand=True)
-        self.nb.add(f1, text="Большие файлы")
+        self.nb.add(f1, text="  Большие файлы  ")
 
         # Вкладка: дерево папок
-        f2 = ttk.Frame(self.nb)
-        bar2 = ttk.Frame(f2, padding=(0, 4))
-        bar2.pack(fill="x")
-        ttk.Label(bar2, text="Найти папку:").pack(side="left")
+        f2 = ttk.Frame(self.nb, padding=(12, 12, 12, 0))
+        bar2 = self._panel(f2, pady=(0, 6))
+        db = ttk.Frame(bar2, style="Panel.TFrame")
+        db.pack(side="right", anchor="s")
+        ttk.Button(db, text="Показать списком", command=self.fill_dir_list, style="Accent.TButton" if sv_ttk else "TButton").pack(side="left", ipady=2)
+        ttk.Button(db, text="Дерево", command=self.show_dir_tree).pack(side="left", padx=(8, 0), ipady=2)
         self.dir_search_var = tk.StringVar()
-        e1 = ttk.Entry(bar2, textvariable=self.dir_search_var, width=22)
-        e1.pack(side="left", padx=4)
-        ttk.Label(bar2, text=" Вложенность:").pack(side="left")
+        e1 = self._field(bar2, "Найти папку по имени", ttk.Entry, textvariable=self.dir_search_var, width=20)
         self.dir_depth_var = tk.StringVar(value="любая")
-        ttk.Combobox(bar2, textvariable=self.dir_depth_var, width=7, state="readonly",
-                     values=["любая", "1", "2", "3", "4", "5", "6"]).pack(side="left", padx=4)
-        ttk.Label(bar2, text=" от (МБ):").pack(side="left")
+        self._field(bar2, "Вложенность", ttk.Combobox, textvariable=self.dir_depth_var, width=8, state="readonly",
+                    values=["любая", "1", "2", "3", "4", "5", "6"])
         self.dir_min_var = tk.StringVar(value="100")
-        e2 = ttk.Spinbox(bar2, from_=0, to=1000000, increment=100, textvariable=self.dir_min_var, width=7)
-        e2.pack(side="left", padx=4)
-        ttk.Label(bar2, text=" Скрыть:").pack(side="left")
+        e2 = self._field(bar2, "От, МБ", ttk.Spinbox, from_=0, to=1000000, increment=100,
+                         textvariable=self.dir_min_var, width=8)
         self.dir_exclude_var = tk.StringVar()
-        e3 = ttk.Entry(bar2, textvariable=self.dir_exclude_var, width=18)
-        e3.pack(side="left", padx=4)
+        e3 = self._field(bar2, "Скрыть папки", ttk.Entry, expand=True, textvariable=self.dir_exclude_var, width=14)
         self.dir_top_only = tk.BooleanVar(value=True)
-        ttk.Checkbutton(bar2, text="без вложенных повторов", variable=self.dir_top_only).pack(side="left", padx=4)
-        ttk.Button(bar2, text="Список", command=self.fill_dir_list).pack(side="left", padx=2)
-        ttk.Button(bar2, text="Дерево", command=self.show_dir_tree).pack(side="left", padx=2)
+        ttk.Checkbutton(bar2, text="без вложенных повторов", variable=self.dir_top_only,
+                        style="Panel.TCheckbutton").pack(side="left", anchor="s", pady=(0, 6), padx=(0, 12))
         for w in (e1, e2, e3):
             w.bind("<Return>", lambda e: self.fill_dir_list())
-        self.dir_info = ttk.Label(f2, text="Дерево: раскрывайте папки. «Список» — плоский перечень папок по фильтру, "
-                                           "от самых тяжёлых.", foreground="gray")
-        self.dir_info.pack(fill="x")
-        self.t_dirs = Table(f2, [("size", "Размер", 100, "size"), ("pct", "% от диска", 90, "pct"),
+        self.dir_info = ttk.Label(f2, text="Дерево: раскрывайте папки. «Показать списком» — плоский перечень папок "
+                                           "по фильтру, от самых тяжёлых.", style="Muted.TLabel")
+        self.dir_info.pack(anchor="w", pady=(0, 6))
+        self.t_dirs = Table(f2, [("size", "Размер", 100, "size"), ("pct", "Доля", 190, "pct"),
                                  ("files", "Файлов", 90, "int"), ("name", "Папка", 220, "text"),
                                  ("path", "Полный путь", 600, "text")], path_col=4)
         self.dirtree_frame = ttk.Frame(f2)
@@ -597,32 +1468,33 @@ class App(tk.Tk):
         self.dirtree.heading("size", text="Размер")
         self.dirtree.heading("pct", text="% от родителя")
         self.dirtree.heading("files", text="Файлов")
-        self.dirtree.column("#0", width=600)
-        for c, w in (("size", 100), ("pct", 110), ("files", 100)):
-            self.dirtree.column(c, width=w, anchor="e", stretch=False)
+        self.dirtree.column("#0", width=560)
+        for c, w in (("size", 100), ("pct", 200), ("files", 100)):
+            self.dirtree.column(c, width=w, anchor="w" if c == "pct" else "e", stretch=False)
         ys = ttk.Scrollbar(f2_tree, orient="vertical", command=self.dirtree.yview)
         self.dirtree.configure(yscrollcommand=ys.set)
         self.dirtree.pack(side="left", fill="both", expand=True)
         ys.pack(side="right", fill="y")
         self.dirtree.bind("<<TreeviewOpen>>", self._tree_open)
-        self.nb.add(f2, text="Папки")
+        self.nb.add(f2, text="  Папки  ")
 
         # Вкладка: мусор
-        f3 = ttk.Frame(self.nb)
-        bar3 = ttk.Frame(f3, padding=(0, 4))
+        f3 = ttk.Frame(self.nb, padding=(12, 12, 12, 0))
+        bar3 = ttk.Frame(f3, padding=(0, 0, 0, 8))
         bar3.pack(fill="x")
         self.junk_info = ttk.Label(bar3, text="Кандидаты на удаление. Проверяйте перед удалением!")
         self.junk_info.pack(side="left")
         self.t_junk = Table(f3, [("cat", "Категория", 170, "text"), ("size", "Размер", 90, "size"),
                                  ("kind", "Что", 60, "text"), ("path", "Путь", 700, "text")], path_col=3)
         self.t_junk.pack(fill="both", expand=True)
-        self.nb.add(f3, text="Мусор")
+        self.nb.add(f3, text="  Мусор  ")
 
         # Вкладка: дубликаты
-        f4 = ttk.Frame(self.nb)
-        bar4 = ttk.Frame(f4, padding=(0, 4))
+        f4 = ttk.Frame(self.nb, padding=(12, 12, 12, 0))
+        bar4 = ttk.Frame(f4, padding=(0, 0, 0, 8))
         bar4.pack(fill="x")
-        self.dup_btn = ttk.Button(bar4, text="Найти дубликаты среди больших файлов", command=self.start_dups)
+        self.dup_btn = ttk.Button(bar4, text="Найти дубликаты среди больших файлов", command=self.start_dups,
+                                  style="Accent.TButton" if sv_ttk else "TButton")
         self.dup_btn.pack(side="left")
         self.dup_info = ttk.Label(bar4, text="  Сравнение по содержимому (хэш), имена не важны.")
         self.dup_info.pack(side="left")
@@ -637,22 +1509,59 @@ class App(tk.Tk):
         self.duptree.configure(yscrollcommand=ys4.set)
         self.duptree.pack(side="left", fill="both", expand=True)
         ys4.pack(side="right", fill="y")
-        self.nb.add(f4, text="Дубликаты")
+        self.nb.add(f4, text="  Дубликаты  ")
 
         # Вкладка: типы файлов
-        f5 = ttk.Frame(self.nb)
+        f5 = ttk.Frame(self.nb, padding=(12, 12, 12, 12))
         self.t_types = Table(f5, [("ext", "Расширение", 160, "text"), ("count", "Файлов", 100, "int"),
-                                  ("size", "Общий размер", 120, "size"), ("pct", "Доля", 80, "pct")], path_col=0)
+                                  ("size", "Общий размер", 120, "size"), ("pct", "Доля", 190, "pct")], path_col=0)
         self.t_types.pack(fill="both", expand=True)
-        self.nb.add(f5, text="Типы файлов")
+        self.nb.add(f5, text="  Типы файлов  ")
+
+        # Вкладка: здоровье дисков
+        f6 = ttk.Frame(self.nb, padding=(12, 12, 12, 0))
+        bar6 = self._panel(f6, pady=(0, 8))
+        ttk.Button(bar6, text="Обновить", command=lambda: self.start_health(alert=False),
+                   style="Accent.TButton" if sv_ttk else "TButton").pack(side="left", ipady=2)
+        if IS_WIN and not is_admin():
+            ttk.Button(bar6, text="🛡  Перезапустить от администратора",
+                       command=self.restart_as_admin).pack(side="left", padx=(8, 0), ipady=2)
+        hint = self._label(bar6, "SMART читается без прав администратора. Прогноз ресурса приблизительный, "
+                                 "а исправный SMART не гарантирует, что диск не откажет — делайте резервные копии.",
+                           role="muted", font=self.f_small, wraplength=620, justify="left")
+        hint.bg_role = "panel"
+        hint.pack(side="left", padx=14)
+        wrap = self._frame(f6)
+        wrap.pack(fill="both", expand=True)
+        self.h_canvas = tk.Canvas(wrap, bd=0, highlightthickness=0)
+        self.plain_canvases = [self.h_canvas]
+        hsb = ttk.Scrollbar(wrap, orient="vertical", command=self.h_canvas.yview)
+        self.h_canvas.configure(yscrollcommand=hsb.set)
+        hsb.pack(side="right", fill="y")
+        self.h_canvas.pack(side="left", fill="both", expand=True)
+        self.h_inner = self._frame(self.h_canvas)
+        self.h_win = self.h_canvas.create_window(0, 0, window=self.h_inner, anchor="nw")
+        self.h_inner.bind("<Configure>", lambda e: self.h_canvas.configure(scrollregion=self.h_canvas.bbox("all")))
+        self.h_canvas.bind("<Configure>", lambda e: self.h_canvas.itemconfigure(self.h_win, width=e.width - 4))
+        wheel = lambda e: self.h_canvas.yview_scroll(int(-e.delta / 120), "units")
+        self.h_canvas.bind("<Enter>", lambda e: self.h_canvas.bind_all("<MouseWheel>", wheel))
+        self.h_canvas.bind("<Leave>", lambda e: self.h_canvas.unbind_all("<MouseWheel>"))
+        self._label(self.h_inner, "Проверяю диски…", role="muted").pack(anchor="w")
+        self.health_tab = f6
+        self.nb.add(f6, text="  Здоровье дисков  ")
 
         # строка состояния
-        bottom = ttk.Frame(self, padding=6)
-        bottom.pack(fill="x")
-        self.progress = ttk.Progressbar(bottom, mode="indeterminate", length=180)
+        bottom = self._frame(root)
+        bottom.pack(side="bottom", fill="x", pady=10, before=self.nb)
+        self.progress = ttk.Progressbar(bottom, mode="indeterminate", length=220)
         self.progress.pack(side="left")
-        self.status = ttk.Label(bottom, text="Выберите диск или папку и нажмите «Сканировать».")
-        self.status.pack(side="left", padx=8)
+        self.status = ttk.Label(bottom, text="Выберите диск (можно щёлкнуть по карточке) и нажмите «Сканировать».",
+                                style="Muted.TLabel")
+        self.status.pack(side="left", padx=10)
+        note = ttk.Label(bottom, text="ⓘ  Программа «как есть» · вы отвечаете за удаление", style="Muted.TLabel",
+                         cursor="hand2")
+        note.pack(side="right", before=self.status)   # пометка важнее — длинный статус обрежется, а не она
+        note.bind("<Button-1>", lambda e: self.show_disclaimer())
 
         # контекстное меню
         self.menu = tk.Menu(self, tearoff=0)
@@ -668,6 +1577,28 @@ class App(tk.Tk):
             w.bind("<Button-3>", self._popup)
             w.bind("<Double-1>", lambda e: self.reveal())
             w.bind("<Delete>", lambda e: self.delete_selected())
+
+    def _auto_workers(self):
+        """Подбирает число процессов под тип диска выбранной папки."""
+        path = self.path_var.get().strip()
+        if not path or not os.path.splitdrive(path)[0] and IS_WIN:
+            return
+        drive = os.path.splitdrive(os.path.abspath(path))[0].upper()
+        if getattr(self, "_last_drive", None) == drive:
+            return                       # тот же диск — не трогаем ручную настройку
+        self._last_drive = drive
+        kind, n = workers_for(path)
+        self.workers_var.set(str(n))
+        cores = os.cpu_count() or 0
+        if kind in ("HDD", "USB"):
+            note = f"{kind}, медленный"
+        elif kind == "SSD":
+            note = "SSD"
+        elif kind == "Сеть":
+            note = "сетевой диск"
+        else:
+            note = "диск ?"
+        self.drive_label.config(text=f"Процессов · {note}")
 
     def _browse(self):
         d = filedialog.askdirectory()
@@ -728,6 +1659,8 @@ class App(tk.Tk):
                     self.status.config(text=f"Проверка дубликатов {done}/{total}: {path[-90:]}")
                 elif kind == "dupdone":
                     self._dups_done(msg[1])
+                elif kind == "health":
+                    self._health_done(msg[1], msg[2])
         except queue.Empty:
             pass
         self.after(100, self._poll)
@@ -759,6 +1692,19 @@ class App(tk.Tk):
         types.sort(key=lambda x: x[2], reverse=True)
         self.t_types.set_rows(types)
         self.duptree.delete(*self.duptree.get_children())
+        junk_total = sum(x[1] for x in junk_rows)
+        big_total = sum(f[0] for f in r.big_files)
+        self._set_stat("total", human(r.total), r.root)
+        self._set_stat("files", f"{r.files:,}".replace(",", " "), f"папок: {len(r.dir_total):,}".replace(",", " "))
+        self._set_stat("big", f"{len(r.big_files):,}".replace(",", " "), f"вместе {human(big_total)}")
+        self._set_stat("junk", human(junk_total), f"{len(junk_rows):,} объектов".replace(",", " "))
+        speed = r.files / r.seconds if r.seconds else 0
+        self._set_stat("time", f"{r.seconds:.1f} с", f"{speed:,.0f} файлов/с · {self._workers()} проц.".replace(",", " "))
+
+    def _set_stat(self, key, value, sub=""):
+        v, s_ = self.stat[key]
+        v.configure(text=value)
+        s_.configure(text=sub if len(sub) < 40 else "…" + sub[-38:])
 
     def fill_files(self):
         if not self.result:
@@ -842,8 +1788,8 @@ class App(tk.Tk):
     def show_dir_tree(self):
         self.t_dirs.pack_forget()
         self.dirtree_frame.pack(fill="both", expand=True)
-        self.dir_info.config(text="Дерево: раскрывайте папки. «Список» — плоский перечень папок по фильтру, "
-                                  "от самых тяжёлых.")
+        self.dir_info.config(text="Дерево: раскрывайте папки. «Показать списком» — плоский перечень папок "
+                                  "по фильтру, от самых тяжёлых.")
 
     def show_in_tree(self):
         r = self.result
@@ -898,8 +1844,9 @@ class App(tk.Tk):
         t.delete(*t.get_children())
         r = self.result
         root = r.root
-        t.insert("", "end", iid=root, text=root, open=True,
-                 values=(human(r.dir_total.get(root, 0)), "100.0 %", r.dir_files.get(root, 0)))
+        t.insert("", "end", iid=root, text="  " + root, open=True, tags=("group",),
+                 values=(human(r.dir_total.get(root, 0)), pct_bar(100),
+                         f"{r.dir_files.get(root, 0):,}".replace(",", " ")))
         self._populate(root)
 
     def _populate(self, parent):
@@ -909,10 +1856,11 @@ class App(tk.Tk):
             t.delete(ch)
         ptotal = r.dir_total.get(parent, 0) or 1
         kids = sorted(r.children.get(parent, []), key=lambda p: r.dir_total.get(p, 0), reverse=True)
-        for p in kids:
+        for i, p in enumerate(kids):
             size = r.dir_total.get(p, 0)
-            t.insert(parent, "end", iid=p, text=os.path.basename(p) or p,
-                     values=(human(size), f"{size * 100 / ptotal:.1f} %", f"{r.dir_files.get(p, 0):,}".replace(",", " ")))
+            t.insert(parent, "end", iid=p, text="📁 " + (os.path.basename(p) or p),
+                     tags=("odd" if i % 2 else "even", size_tag(size)),
+                     values=(human(size), pct_bar(size * 100 / ptotal), f"{r.dir_files.get(p, 0):,}".replace(",", " ")))
             if r.children.get(p):
                 t.insert(p, "end", iid=p + "|dummy", text="…")
 
@@ -921,6 +1869,186 @@ class App(tk.Tk):
         kids = self.dirtree.get_children(node)
         if len(kids) == 1 and kids[0].endswith("|dummy"):
             self._populate(node)
+
+    # ---------- здоровье дисков
+    def start_health(self, alert=False):
+        def work():
+            try:
+                disks = read_disks_health()
+            except Exception:
+                disks = []
+            self.q.put(("health", disks, alert))
+        threading.Thread(target=work, daemon=True).start()
+
+    def restart_as_admin(self):
+        import ctypes
+        if getattr(sys, "frozen", False):
+            exe, params = sys.executable, ""
+        else:
+            exe = sys.executable
+            w = os.path.join(os.path.dirname(exe), "pythonw.exe")
+            exe = w if os.path.exists(w) else exe
+            params = f'"{os.path.abspath(sys.argv[0])}"'
+        if ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1) > 32:
+            self.destroy()
+
+    def _health_done(self, disks, alert):
+        self.health = disks
+        for w in self.h_inner.winfo_children():
+            w.destroy()
+        if not disks:
+            self._label(self.h_inner, "Не удалось получить данные о дисках.", role="muted").pack(anchor="w")
+        for d in disks:
+            self._health_card(d)
+        problems = [d for d in disks if d["level"] in ("warn", "bad")]
+        self.nb.tab(self.health_tab, text="  ⚠ Здоровье дисков  " if problems else "  Здоровье дисков  ")
+        dot = {"good": ("ok", "● исправен"), "warn": ("orange", "● внимание"), "bad": ("warn", "● плохо"),
+               "unknown": ("muted", "")}
+        for d in disks:
+            for letter in d["letters"]:
+                lb = self.drive_health_lbl.get(letter)
+                if lb is not None:
+                    lb.role, text = dot[d["level"]]
+                    lb.configure(text=text)
+        self._recolor()
+        if alert and problems:
+            worst = any(d["level"] == "bad" for d in problems)
+            parts = []
+            for d in problems:
+                where = ", ".join(d["letters"]) or "без буквы"
+                head = f"• {d['model']} ({where}) — {'ПЛОХО' if d['level'] == 'bad' else 'внимание'}"
+                parts.append(head + "".join(f"\n     {t}" for _, t in d["problems"][:3]))
+            msg = ("С дисками есть проблемы:\n\n" + "\n\n".join(parts) +
+                   "\n\nСделайте резервную копию важных данных как можно скорее. "
+                   "Подробности — на вкладке «Здоровье дисков».")
+            (messagebox.showerror if worst else messagebox.showwarning)("Проверьте диски", msg, parent=self)
+            self.nb.select(self.health_tab)
+
+    def show_smart(self, d):
+        pal = PALETTE[self.mode]
+        win = tk.Toplevel(self)
+        win.title(f"SMART — {d['model']}")
+        win.geometry("980x640" if d.get("nvme") else "1120x660")
+        win.minsize(700, 400)
+        win.transient(self)
+        base = ttk.Style().lookup("TFrame", "background") or pal["card"]
+        win.configure(bg=base)
+        body = ttk.Frame(win, padding=(18, 14, 18, 14))
+        body.pack(fill="both", expand=True)
+        levels = {"good": ("ok", "Исправен"), "warn": ("orange", "Внимание"), "bad": ("warn", "Плохо"),
+                  "unknown": ("muted", "Нет данных")}
+        role, state = levels.get(d.get("level"), ("muted", "?"))
+        head = ttk.Frame(body)
+        head.pack(fill="x")
+        tk.Label(head, text=d["model"], font=self.f_big, bg=base, fg=pal["text"]).pack(side="left")
+        tk.Label(head, text=f"   ●  {state}   ", font=self.f_bold, bg=pal[role], fg=pal["card"]).pack(side="right", ipady=3)
+        kind = ("SSD" if d["ssd"] else "HDD") if d.get("ssd") is not None else ""
+        info = " · ".join(x for x in (d["bus"], kind, human(d["size"]) if d.get("size") else "",
+                                      ("диск " + ", ".join(d["letters"])) if d.get("letters") else "",
+                                      ("S/N " + d["serial"]) if d.get("serial") else "") if x)
+        tk.Label(body, text=info, font=self.f_norm, bg=base, fg=pal["muted"]).pack(anchor="w", pady=(4, 0))
+        src = d.get("source") or "—"
+        if d.get("ata") and not d.get("thresholds"):
+            src += " · пороги отказа видны только при запуске от администратора"
+        tk.Label(body, text="Источник: " + src, font=self.f_small, bg=base, fg=pal["muted"]).pack(anchor="w", pady=(2, 10))
+
+        nv = bool(d.get("nvme"))
+        cols = [("id", "ID", 50, "center"), ("name", "Атрибут", 300 if d.get("nvme") else 270, "w")]
+        if not nv:
+            cols += [("cur", "Текущее", 80, "e"), ("worst", "Худшее", 80, "e"), ("thr", "Порог", 70, "e")]
+        cols += [("raw", "Значение" if nv else "Raw (сырое значение)", 290 if not nv else 520, "w")]
+        if not nv:
+            cols += [("state", "Состояние", 150, "w")]
+        frame = ttk.Frame(body)
+        frame.pack(fill="both", expand=True)
+        tree = ttk.Treeview(frame, columns=[c[0] for c in cols], show="headings")
+        for cid, title, w, anchor in cols:
+            tree.heading(cid, text=title)
+            tree.column(cid, width=w, anchor=anchor, stretch=cid in ("name", "raw"))
+        ys = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=ys.set)
+        tree.pack(side="left", fill="both", expand=True)
+        ys.pack(side="right", fill="y")
+        tree.tag_configure("odd", background=pal["stripe"])
+        tree.tag_configure("warn", foreground=pal["orange"])
+        tree.tag_configure("bad", foreground=pal["warn"], font=self.f_bold)
+        for i, r in enumerate(smart_rows(d)):
+            aid, name, cur, worst, thr, raw, st, lvl = r
+            vals = [aid, name] + ([] if nv else [cur, worst, thr]) + [raw] + ([] if nv else [st])
+            tree.insert("", "end", values=vals, tags=("odd" if i % 2 else "even", lvl))
+
+        btns = ttk.Frame(body)
+        btns.pack(fill="x", pady=(12, 0))
+        tk.Label(btns, text="Оранжевым — стоит присмотреться, красным — признак отказа.", font=self.f_small,
+                 bg=base, fg=pal["muted"]).pack(side="left")
+        ttk.Button(btns, text="Закрыть", command=win.destroy).pack(side="right")
+
+        def copy():
+            self.clipboard_clear()
+            self.clipboard_append(smart_report(d))
+            copy_btn.configure(text="✓ Скопировано")
+        copy_btn = ttk.Button(btns, text="Копировать отчёт", command=copy,
+                              style="Accent.TButton" if sv_ttk else "TButton")
+        copy_btn.pack(side="right", padx=8)
+        win.update_idletasks()
+        if self.mode == "dark" and IS_WIN:
+            try:
+                import ctypes
+                hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+                v = ctypes.c_int(1)
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(v), ctypes.sizeof(v))
+            except Exception:
+                pass
+        win.focus_force()
+        return win
+
+    def _health_card(self, d):
+        levels = {"good": ("ok", "Исправен"), "warn": ("orange", "Внимание"), "bad": ("warn", "Плохо"),
+                  "unknown": ("muted", "Нет данных")}
+        role, text = levels[d["level"]]
+        outer, inner = self._card(self.h_inner, padx=20, pady=14)
+        outer.pack(fill="x", pady=(0, 10))
+        top = tk.Frame(inner, bd=0)
+        top.pack(fill="x")
+        self._label(top, d["model"], font=self.f_big).pack(side="left")
+        kind = ("SSD" if d["ssd"] else "HDD") if d["ssd"] is not None else ""
+        sub = " · ".join(x for x in (d["bus"], kind, human(d["size"]) if d["size"] else "",
+                                     ("диск " + ", ".join(d["letters"])) if d["letters"] else "") if x)
+        self._label(top, "    " + sub, role="muted").pack(side="left", pady=(6, 0))
+        pill = self._label(top, f"   ●  {text}   ", role=role, font=self.f_bold)
+        pill.pill = True
+        pill.pack(side="right", ipady=3)
+        if d.get("nvme") or d.get("ata"):
+            ttk.Button(top, text="SMART — подробно", command=lambda d=d: self.show_smart(d)).pack(side="right", padx=10)
+        if d["life"] is not None:
+            row = tk.Frame(inner, bd=0)
+            row.pack(fill="x", pady=(14, 0))
+            self._label(row, f"Ресурс  {d['life']} %", font=self.f_bold).pack(side="left")
+            bar = self._bar(row, width=460, height=10)
+            bar.value = d["life"] / 100
+            bar.color = "ok" if d["life"] > 30 else ("orange" if d["life"] > 10 else "warn")
+            bar.pack(side="left", padx=14)
+            if d["forecast"]:
+                self._label(row, d["forecast"], role="muted", font=self.f_small).pack(side="left")
+        grid = tk.Frame(inner, bd=0)
+        grid.pack(fill="x", pady=(14, 4))
+        for i, (k, v) in enumerate(d["metrics"]):
+            cell = tk.Frame(grid, bd=0)
+            cell.grid(row=i // 4, column=i % 4, sticky="w", padx=(0, 56), pady=(0, 10))
+            self._label(cell, k, role="muted", font=self.f_small).pack(anchor="w")
+            self._label(cell, v, font=self.f_bold).pack(anchor="w")
+        if d["problems"]:
+            for lvl, t in d["problems"]:
+                self._label(inner, ("⛔  " if lvl == "bad" else "⚠  ") + t,
+                            role="warn" if lvl == "bad" else "orange", font=self.f_bold).pack(anchor="w", pady=(2, 0))
+        elif d["level"] == "unknown":
+            self._label(inner, "Диск не отдал данные SMART" + (
+                "." if is_admin() else " без прав администратора — попробуйте «Перезапустить от администратора»."),
+                role="muted").pack(anchor="w")
+        else:
+            self._label(inner, "✓  Проблем не найдено", role="ok", font=self.f_bold).pack(anchor="w")
+        if d.get("source"):
+            self._label(inner, "Источник: " + d["source"], role="muted", font=self.f_small).pack(anchor="w", pady=(6, 0))
 
     # ---------- дубликаты
     def _dups_done(self, groups):
@@ -935,7 +2063,7 @@ class App(tk.Tk):
             extra = sz * (len(paths) - 1)
             waste += extra
             gid = f"group{i}"
-            t.insert("", "end", iid=gid, open=True,
+            t.insert("", "end", iid=gid, open=True, tags=("group", size_tag(extra)),
                      text=f"Группа {i}: {len(paths)} копии по {human(sz)} — лишнее {human(extra)}",
                      values=(human(extra), ""))
             for p in paths:
@@ -943,7 +2071,7 @@ class App(tk.Tk):
                     mt = fmt_date(os.path.getmtime(p))
                 except OSError:
                     mt = ""
-                t.insert(gid, "end", iid=p, text=p, values=(human(sz), mt))
+                t.insert(gid, "end", iid=p, text="   " + p, values=(human(sz), mt))
         self.dup_info.config(text=f"  Групп: {len(groups)}, можно освободить: {human(waste)}. "
                                   f"Оставьте в каждой группе один файл!")
         self.status.config(text="Поиск дубликатов завершён.")
@@ -952,10 +2080,12 @@ class App(tk.Tk):
     def _active(self):
         tab = self.nb.index(self.nb.select())
         folders = self.t_dirs if self.t_dirs.winfo_ismapped() else self.dirtree
-        return {0: self.t_files, 1: folders, 2: self.t_junk, 3: self.duptree, 4: self.t_types}[tab]
+        return {0: self.t_files, 1: folders, 2: self.t_junk, 3: self.duptree, 4: self.t_types}.get(tab)
 
     def selected_paths(self):
         w = self._active()
+        if w is None:
+            return []
         if isinstance(w, Table):
             return [] if w is self.t_types else w.selected_paths()
         return [i for i in w.selection() if not i.startswith("group") and not i.endswith("|dummy")]
@@ -1004,8 +2134,20 @@ class App(tk.Tk):
         preview = "\n".join(paths[:10]) + (f"\n… и ещё {len(paths) - 10}" if len(paths) > 10 else "")
         if not messagebox.askyesno("Удалить в Корзину?",
                                    f"Переместить в Корзину {len(paths)} объект(ов)?\n\n{preview}\n\n"
-                                   f"Их можно будет восстановить из Корзины."):
+                                   f"Их можно будет восстановить из Корзины, пока она не очищена.\n\n"
+                                   f"Вы сами отвечаете за удаление: убедитесь, что эти файлы вам не нужны.",
+                                   icon="warning", parent=self):
             return
+        risky = [p for p in paths if is_risky_path(p)]
+        if risky:
+            rp = "\n".join(risky[:8]) + (f"\n… и ещё {len(risky) - 8}" if len(risky) > 8 else "")
+            if not messagebox.askyesno(
+                    "⚠ Системные файлы",
+                    f"Среди выбранного есть системные папки или файлы программ:\n\n{rp}\n\n"
+                    f"Их удаление может сломать Windows или установленные программы.\n"
+                    f"Удаляйте, только если точно знаете, что делаете.\n\n"
+                    f"Всё равно удалить?", icon="warning", default="no", parent=self):
+                return
         self.config(cursor="watch")
         self.update()
         errors = send_to_recycle_bin(paths)
@@ -1026,6 +2168,9 @@ class App(tk.Tk):
 
     def export_csv(self):
         w = self._active()
+        if w is None:
+            messagebox.showinfo("Экспорт", "На этой вкладке нечего экспортировать — выберите вкладку со списком.")
+            return
         if isinstance(w, Table):
             header, rows = w.export_rows()
         elif w is self.duptree:
@@ -1054,10 +2199,16 @@ class App(tk.Tk):
 if __name__ == "__main__":
     import multiprocessing
     multiprocessing.freeze_support()
+    if len(sys.argv) >= 3 and sys.argv[1] == "--health":
+        import json
+        with open(sys.argv[2], "w", encoding="utf-8") as _f:
+            json.dump([dict({k: v for k, v in x.items() if k != "ata"}, ata_attrs=len(x.get("ata") or {}))
+                       for x in read_disks_health()], _f, ensure_ascii=False, indent=1, default=str)
+        sys.exit(0)
     if len(sys.argv) >= 3 and sys.argv[1] == "--selftest":
         # служебная проверка без окна: disk_cleaner --selftest ПАПКА [ФАЙЛ_ОТЧЁТА]
         _q, _c = queue.Queue(), threading.Event()
-        scan(sys.argv[2], 50 << 20, _q, _c)
+        scan(sys.argv[2], 50 << 20, _q, _c, workers_for(sys.argv[2])[1])
         while True:
             _m = _q.get()
             if _m[0] == "done":
@@ -1066,7 +2217,7 @@ if __name__ == "__main__":
         _out = sys.argv[3] if len(sys.argv) > 3 else "selftest.txt"
         with open(_out, "w", encoding="utf-8") as _f:
             _f.write(f"files={_r.files} total={human(_r.total)} dirs={len(_r.dir_total)} "
-                     f"sec={_r.seconds:.2f} workers={default_workers()}\n")
+                     f"sec={_r.seconds:.2f} drive={drive_kind(sys.argv[2])} workers={workers_for(sys.argv[2])[1]}\n")
         sys.exit(0)
     if IS_WIN:
         try:
@@ -1074,4 +2225,10 @@ if __name__ == "__main__":
             ctypes.windll.shcore.SetProcessDpiAwareness(1)  # чёткий шрифт на мониторах с масштабированием
         except Exception:
             pass
-    App().mainloop()
+    app = App()
+    app.update()
+    if app.ask_disclaimer():
+        app.start_health(alert=True)
+        app.mainloop()
+    else:
+        app.destroy()
